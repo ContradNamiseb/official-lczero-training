@@ -1,5 +1,14 @@
 # WARNING: THIS BRANCH REQUIRES TENSORFLOW 2.13+ AND HAS ONLY BEEN TESTED WITH 2.14
 
+Two local training backends are documented separately. They share the model
+code and coexist in this checkout; follow the runbook for the machine you are
+training on:
+
+- **Windows / DirectML** (TensorFlow 2.10, `.venv-directml`) --
+  [docs/directml-training.md](docs/directml-training.md)
+- **WSL2 or Linux / Intel XPU** (TensorFlow 2.15 with Intel Extension for
+  TensorFlow, `.venv-xpu`) -- [docs/xpu-training.md](docs/xpu-training.md)
+
 # What's new here?
 
 I've added a few features and modules to the training pipeline. Please direct any questions to the Leela Discord server.

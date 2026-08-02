@@ -1,0 +1,15 @@
+# Intel Extension for TensorFlow (XPU) stack.
+#
+# XPU wheels are Linux-only: run this inside native Ubuntu 22.04 or WSL2.
+# The Intel GPU compute runtime (level-zero / intel-opencl-icd) and the oneAPI
+# DPC++ and oneMKL runtimes must already be installed in that Linux system.
+#
+# tensorflow-addons is deliberately absent: Keras 2.15 ships mish natively and
+# tfa has no XPU kernels.
+numpy<2
+protobuf
+pyyaml
+rich
+grpcio-tools
+tensorflow==2.15.0
+intel-extension-for-tensorflow[xpu]>=2.15.0,<2.16
