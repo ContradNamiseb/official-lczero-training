@@ -1,0 +1,109 @@
+%YAML 1.2
+---
+name: 'kda-hybrid-512x12-no-rmsnorm'
+gpu: 0
+dataset:
+    num_chunks: 500_000_000
+    allow_less_chunks: true
+    train_ratio: 0.95
+    input_train:
+        - '/path/to/training-data/*/'
+    input_test:
+        - '/path/to/test-data/*/'
+    train_workers: 8
+    test_workers: 4
+    fast_chunk_loading: true
+training:
+    precision: half
+    disable_pb_checkpointing: true
+    swa: true
+    swa_output: true
+    swa_max_n: 10
+    swa_steps: 100
+    max_grad_norm: 1.0
+    batch_size: 2048
+    num_batch_splits: 1
+    value_focus_min: 1.0
+    value_focus_slope: 0.0
+    lookahead_optimizer: false
+    renorm: true
+    renorm_max_r: 1.0
+    renorm_max_d: 0.0
+    test_steps: 1000
+    num_test_positions: 131_072
+    train_avg_report_steps: 1000
+    total_steps: 2_000_000
+    checkpoint_steps: 50_000
+    shuffle_size: 1_000_000
+    warmup_steps: 1000
+    mask_legal_moves: true
+    lr_values:
+        - 0.001
+        - 0.001
+    lr_boundaries:
+        - 100
+    loss_weights:
+        policy: 1.0
+        policy_optimistic_st: 1.0
+        policy_soft: 8.0
+        policy_opponent: 0.0
+        policy_next: 0.0
+        value_winner: 1.0
+        value_q: 1.0
+        value_q_cat: 0.1
+        value_st: 1.0
+        value_q_err: 10.0
+        value_st_err: 10.0
+        value_st_cat: 0.1
+        moves_left: 1.0
+        reg: 1.0
+    path: 'networks'
+    optimizer: nadam
+    beta_1: 0.9
+    beta_2: 0.98
+    epsilon: 0.00000001
+    sparse: false
+model:
+    embedding_size: 512
+    policy_embedding_size: 512
+    value_embedding_size: 128
+    moves_left_embedding_size: 32
+    encoder_layers: 12
+    encoder_heads: 16
+    encoder_d_model: 512
+    encoder_dff: 512
+    encoder_mixer_pattern: [kda, kda, kda, mha]
+    kda_key_dim: 32
+    kda_value_dim: 32
+    kda_gate_rank: 32
+    kda_directions:
+        - rank_forward
+        - rank_reverse
+        - file_forward
+        - file_reverse
+    kda_output_gate: true
+    policy_d_model: 512
+    policy_d_aux: 512
+    dropout_rate: 0.0
+    embedding_style: 'new'
+    embedding_dense_sz: 64
+    value: 'wdl'
+    moves_left: 'v1'
+    input_type: 'classic'
+    use_smolgen: true
+    smolgen_hidden_channels: 32
+    smolgen_hidden_sz: 256
+    smolgen_gen_sz: 256
+    smolgen_activation: 'swish'
+    use_logit_gating: false
+    omit_qkv_biases: true
+    omit_other_biases: false
+    return_attn_wts: false
+    policy_optimistic_st: true
+    policy_opponent: false
+    policy_next: false
+    value_st: true
+    value_q: true
+    soft_policy: true
+    categorical_value_buckets: 32
+    soft_policy_temperature: 4.0

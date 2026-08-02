@@ -85,6 +85,8 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.venv-directml/
+.venv-xpu/
 env/
 venv/
 ENV/

@@ -1,0 +1,207 @@
+%YAML 1.2
+---
+name: 'kda-hybrid-128x4-3k1m-8h-small-gen'
+gpu: 0
+dataset:
+    num_chunks: 295_977
+    allow_less_chunks: true
+    train_ratio: 0.98
+    input_train:
+        - 'C:/Users/Contrad/Documents/training-data/*/'
+    input_test:
+        - 'C:/Users/Contrad/Documents/training-test-data/*/'
+    train_workers: 6
+    test_workers: 1
+    fast_chunk_loading: true
+training:
+    precision: single
+    disable_pb_checkpointing: false
+    swa: true
+    swa_output: false
+    swa_max_n: 10
+    swa_steps: 100
+    max_grad_norm: 1.0
+    batch_size: 512
+    num_batch_splits: 4
+    value_focus_min: 1.0
+    value_focus_slope: 0.0
+    lookahead_optimizer: false
+    renorm: true
+    renorm_max_r: 1.0
+    renorm_max_d: 0.0
+    test_steps: 100
+    num_test_positions: 200
+    train_avg_report_steps: 100
+    total_steps: 50000
+    checkpoint_steps: 500
+    shuffle_size: 1_000
+    warmup_steps: 100
+    mask_legal_moves: true
+    lr_values:
+        - 0.0001
+        - 0.00001
+    lr_boundaries:
+        - 5000
+    loss_weights:
+        policy: 1.0
+        policy_optimistic_st: 1.0
+        policy_soft: 8.0
+        policy_opponent: 0.0
+        policy_next: 0.0
+        value_winner: 1.0
+        value_q: 1.0
+        value_q_cat: 0.1
+        value_st: 1.0
+        value_q_err: 10.0
+        value_st_err: 10.0
+        value_st_cat: 0.1
+        moves_left: 1.0
+        reg: 1.0
+    path: 'networks'
+    optimizer: nadam
+    beta_1: 0.9
+    beta_2: 0.98
+    epsilon: 0.00000001
+    sparse: false
+model:
+    # ---- Backbone width -------------------------------------------------
+    # Residual stream width. Every encoder block reads and writes this size,
+    # for all 64 square tokens. This is the "x" in an "NxL" net name.
+    embedding_size: 128
+    # Width of the per-square tokens fed to the policy head. Defaults to
+    # embedding_size if omitted.
+    policy_embedding_size: 128
+    # Per-square width inside the value head before it is flattened
+    # (64 * value_embedding_size -> dense 128). Default 32.
+    value_embedding_size: 64
+    # Same idea for the moves-left head. Default 8.
+    moves_left_embedding_size: 32
+
+    # ---- Encoder stack --------------------------------------------------
+    # Number of encoder blocks. This is the "L" in an "NxL" net name.
+    encoder_layers: 4
+    # Heads used by BOTH mixer types. Two hard constraints:
+    #   * encoder_d_model % encoder_heads == 0  (asserted in mha())
+    #   * encoder_heads % len(kda_directions) == 0, so the traversal
+    #     directions can be split evenly across head groups.
+    # With 8 heads and 4 directions each direction gets 2 heads.
+    encoder_heads: 8
+    # Total q/k/v width of an MHA layer; per-head depth is
+    # encoder_d_model / encoder_heads (= 16 here). MHA layers only -- KDA
+    # layers size themselves from kda_key_dim / kda_value_dim instead and
+    # ignore this value entirely.
+    encoder_d_model: 128
+    # Hidden width of the FFN in every block (both mixer types).
+    # Defaults to 1.5 * embedding_size; 1x here to save DirectML memory.
+    encoder_dff: 128
+    # Which mixer each block uses. The pattern is cycled with
+    # index % len(pattern), so it does not have to match encoder_layers:
+    # 4 layers here give kda, kda, kda, mha (3:1 KDA-to-MHA).
+    # Only "kda" and "mha" are accepted. All-"mha" reproduces a plain
+    # transformer; putting "mha" last lets a global-attention layer clean up
+    # after the linear-attention layers.
+    encoder_mixer_pattern: [kda, kda, kda, mha]
+
+    # ---- KDA (Kimi Delta Attention) mixer -------------------------------
+    # Per-head query/key width of a KDA layer. Also the number of gated
+    # state dimensions, since the forget gate is per-dimension.
+    kda_key_dim: 32
+    # Per-head value width. The recurrence state is
+    # [heads, kda_key_dim, kda_value_dim] per layer, so cost and memory grow
+    # with the product of these two. Total mixer output before the final
+    # projection is encoder_heads * kda_value_dim (= 256 here), which is then
+    # projected back down to embedding_size.
+    kda_value_dim: 32
+    # Bottleneck rank of the low-rank pairs that produce the decay gate
+    # (decay_a -> decay_b) and the output gate (gate_a -> gate_b).
+    # Smaller = fewer parameters and a smoother gate; must be > 0.
+    kda_gate_rank: 32
+    # Board traversal orders for the recurrence. A chess position is not a
+    # causal sequence, so heads are split evenly across these and each group
+    # scans the 64 squares in its own order. Must be a non-empty list with no
+    # duplicates, drawn from these four names, and encoder_heads must be
+    # divisible by its length. Using all four gives every square context from
+    # both ranks and files in both directions.
+    kda_directions:
+        - rank_forward
+        - rank_reverse
+        - file_forward
+        - file_reverse
+    # Sigmoid gate applied to the mixer output before the final projection.
+    # This replaces FLA's gated RMSNorm; leave on unless you are deliberately
+    # training an ungated variant.
+    kda_output_gate: true
+
+    # ---- Policy head ----------------------------------------------------
+    # Width of the policy attention projection. Defaults to embedding_size.
+    policy_d_model: 128
+    # Width used by the auxiliary soft-policy head. Defaults to
+    # policy_d_model.
+    policy_d_aux: 128
+
+    # ---- Regularisation / input -----------------------------------------
+    # Dropout inside the encoder blocks. 0 is standard for lc0 nets.
+    dropout_rate: 0.0
+    # 'new' uses the dense positional-encoding embedding (PE_DENSE) with the
+    # bottleneck below; the alternative maps positional encodings directly.
+    embedding_style: 'new'
+    # Bottleneck width of the 'new' input embedding.
+    embedding_dense_sz: 64
+    # 'wdl' = 3-way win/draw/loss output. The alternative is a scalar value.
+    value: 'wdl'
+    # Moves-left head format.
+    moves_left: 'v1'
+    # Input plane encoding of the training data.
+    input_type: 'classic'
+
+    # ---- Attention-logit extras (MHA layers only) -----------------------
+    # Smolgen generates a per-head 64x64 additive bias for the attention
+    # logits. It only affects "mha" layers -- KDA has no logit matrix -- so a
+    # 3:1 hybrid gets far less benefit from it than an all-MHA net.
+    # Mutually exclusive with use_logit_gating (asserted).
+    use_smolgen: true
+    # Per-square compression before the 64*channels flatten.
+    smolgen_hidden_channels: 8
+    # Width of smolgen's shared hidden layer.
+    smolgen_hidden_sz: 32
+    # Per-head width fed to the shared 64x64 weight generator.
+    smolgen_gen_sz: 32
+    smolgen_activation: 'swish'
+    # Learned per-element bias on the attention logits. Cheaper alternative
+    # to smolgen; cannot be combined with it.
+    use_logit_gating: false
+
+    # ---- Bias switches ---------------------------------------------------
+    # Drop biases on the q/k/v projections (both mixers). Setting these to
+    # true shrinks the net slightly; keep false unless matching an existing
+    # architecture.
+    omit_qkv_biases: false
+    # Drop biases everywhere else (FFN, dense, KDA gate/decay projections).
+    omit_other_biases: false
+    # Debug only: also return attention weights from the model.
+    return_attn_wts: false
+
+    # ---- Auxiliary heads -------------------------------------------------
+    # Each switch below adds a head; its loss must also be given a non-zero
+    # weight in training.loss_weights or the head trains on nothing.
+    # Optimistic short-term policy head (loss_weights.policy_optimistic_st).
+    policy_optimistic_st: true
+    # Predict the opponent's reply policy (loss_weights.policy_opponent).
+    policy_opponent: false
+    # Predict the policy at the next position (loss_weights.policy_next).
+    policy_next: false
+    # Short-term value head (loss_weights.value_st / value_st_err).
+    value_st: true
+    # Train value_st with a scalar loss instead of a distributional one.
+    value_st_scalar_loss: true
+    # Search-Q value head (loss_weights.value_q / value_q_err).
+    value_q: true
+    # Auxiliary policy target softened by soft_policy_temperature
+    # (loss_weights.policy_soft).
+    soft_policy: true
+    # Number of buckets for the categorical value outputs
+    # (loss_weights.value_q_cat / value_st_cat). 0 disables them.
+    categorical_value_buckets: 16
+    # Temperature applied to the soft-policy target. >1 flattens it, giving a
+    # denser training signal than the sharp visit-count policy.
+    soft_policy_temperature: 2.0

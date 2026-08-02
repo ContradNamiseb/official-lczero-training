@@ -162,6 +162,18 @@ def get_input_mode(cfg):
 
 def main(cmd):
     cfg = yaml.safe_load(cmd.cfg.read())
+
+    runtime_overrides = {}
+    if cmd.test_steps is not None:
+        runtime_overrides["test_steps"] = cmd.test_steps
+    if cmd.num_test_positions is not None:
+        runtime_overrides["num_test_positions"] = cmd.num_test_positions
+    if cmd.disable_detailed_summaries:
+        runtime_overrides["detailed_summaries"] = False
+    if cmd.disable_saved_model_checkpointing:
+        runtime_overrides["disable_saved_model_checkpointing"] = True
+    cfg["training"].update(runtime_overrides)
+
     print(yaml.dump(cfg, default_flow_style=False))
 
     num_chunks = cfg["dataset"]["num_chunks"]
@@ -266,10 +278,10 @@ def main(cmd):
         validation_dataset = validation_dataset.map(parse_function)
 
     if tfprocess.strategy is None:  # Mirrored strategy appends prefetch itself with a value depending on number of replicas
-        train_dataset = train_dataset.prefetch(4)
-        test_dataset = test_dataset.prefetch(4)
+        train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+        test_dataset = test_dataset.prefetch(tf.data.AUTOTUNE)
         if validation_dataset is not None:
-            validation_dataset = validation_dataset.prefetch(4)
+            validation_dataset = validation_dataset.prefetch(tf.data.AUTOTUNE)
     else:
         options = tf.data.Options()
         options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.OFF
@@ -296,18 +308,19 @@ def main(cmd):
     num_evals = max(1, num_evals // split_batch_size)
     print("Using {} evaluation batches".format(num_evals))
     tfprocess.total_batch_size = total_batch_size
-    tfprocess.process_loop(total_batch_size,
-                           num_evals,
-                           batch_splits=batch_splits)
+    try:
+        tfprocess.process_loop(total_batch_size,
+                               num_evals,
+                               batch_splits=batch_splits)
 
-    if cmd.output is not None:
-        if cfg["training"].get("swa_output", False):
-            tfprocess.save_swa_weights(cmd.output)
-        else:
-            tfprocess.save_leelaz_weights(cmd.output)
-
-    train_parser.shutdown()
-    test_parser.shutdown()
+        if cmd.output is not None:
+            if cfg["training"].get("swa_output", False):
+                tfprocess.save_swa_weights(cmd.output)
+            else:
+                tfprocess.save_leelaz_weights(cmd.output)
+    finally:
+        train_parser.shutdown()
+        test_parser.shutdown()
 
 
 if __name__ == "__main__":
@@ -319,6 +332,14 @@ if __name__ == "__main__":
     argparser.add_argument("--output",
                            type=str,
                            help="file to store weights in")
+    argparser.add_argument("--test-steps", type=int,
+                           help="override test cadence without editing the config")
+    argparser.add_argument("--num-test-positions", type=int,
+                           help="override test sample size without editing the config")
+    argparser.add_argument("--disable-detailed-summaries", action="store_true",
+                           help="skip full-model TensorBoard histograms and update ratios")
+    argparser.add_argument("--disable-saved-model-checkpointing", action="store_true",
+                           help="skip redundant SavedModel exports while retaining checkpoints and protobuf nets")
 
     # mp.set_start_method("spawn")
     main(argparser.parse_args())

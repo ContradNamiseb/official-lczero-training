@@ -1,0 +1,180 @@
+KDA IMPLEMENTATION COMPARISON: lc0-training (kda-hybrid) vs. fla-org/flash-linear-attention
+===========================================================================================
+
+Summary: yes to all five headline FLA features, with two deliberate deviations
+(no short convolution, no gated output RMSNorm) and one chess-specific addition
+(multi-directional board traversals).
+
+
+FEATURE-BY-FEATURE
+------------------
+
+1. PER-DIMENSION GATING  -- IMPLEMENTED
+   FLA: forget gate g has shape [B, T, H, K] (vector per head, matching key dim).
+   Ours: `raw_decay` is projected through a low-rank pair (decay_a -> decay_b) to
+   `key_depth` and reshaped to [batch, 64, num_heads, kda_key_dim].
+   Location: tf/tfprocess.py, KDA mixer (`raw_decay` reshape, ~L1971-1974).
+
+2. IN-KERNEL L2 NORMALIZATION OF Q/K  -- IMPLEMENTED (fused into the layer)
+   FLA: Q/K L2 normalization folded into the Triton kernels.
+   Ours: `tf.math.l2_normalize` applied to q and k at the top of
+   `KDARecurrence.call`, so it is inside the recurrence op rather than a separate
+   pre-pass. Not a Triton kernel (TF/DirectML target), but functionally identical.
+   Location: tf/tfprocess.py, KDARecurrence.call (~L148-150).
+
+3. SAFE GATE MODE (log gate constrained to (lower_bound, 0))  -- IMPLEMENTED
+   FLA: clamps the log-space gate to (lower_bound, 0) for numerical stability.
+   Ours: the upper bound of 0 is structural -- log_decay = -exp(a_log) * softplus(...)
+   is always <= 0. The lower bound is KDA_LOG_DECAY_FLOOR = -10.0, applied with
+   tf.maximum inside the recurrence.
+   Rationale recorded in code: the chunkwise-parallel form needs exp(+/- cumulative/2)
+   to stay in float32 exponent range, which caps the floor at 176 / KDA_CHUNK_SIZE;
+   retaining exp(-10) of the state per token is indistinguishable from total
+   forgetting, so lc0's unclamped sequential recurrence still matches.
+   Location: tf/tfprocess.py, KDA_LOG_DECAY_FLOOR (~L106) and KDARecurrence.call (~L152-153).
+
+4. LEARNABLE TEMPORAL DYNAMICS (A_log, dt_bias)  -- IMPLEMENTED, same init scheme
+   Ours: `KDALogDecay` layer holds both weights.
+     - a_log   : shape [heads, 1],        init = log(linspace(1.0, 16.0, heads))
+     - dt_bias : shape [heads, key_dim],  init = log(expm1(logspace(0.001, 0.1, key_dim)))
+     - forward : log_decay = -exp(a_log) * softplus(raw_decay + dt_bias)
+   Both are excluded from weight decay (name filter on '/kda/a_log:' and
+   '/kda/dt_bias:').
+   Location: tf/tfprocess.py, class KDALogDecay (~L109-137); weight-decay exclusion (~L1149-1150).
+
+5. TWO EXECUTION MODES (chunk / fused recurrent)  -- SPLIT ACROSS REPOS
+   Training (this repo): chunkwise-parallel form only. KDA_CHUNK_SIZE = 16
+   (measured fastest of 4/8/16/32/64 on DirectML). Each chunk is solved in closed
+   form with dense matmuls; the unit-lower-triangular (I + diag(beta) @ key_attn)
+   is inverted with a Neumann series (key_attn is strictly lower triangular, hence
+   nilpotent, so the series is exact after `chunk` terms, reached by repeated
+   squaring). Sequential depth drops from tokens to tokens / KDA_CHUNK_SIZE.
+   Decay is split symmetrically about the chunk midpoint to keep both factors of
+   exp(cumulative_i - cumulative_j) inside float32 range.
+   Inference: the fused recurrent path lives in the lc0 engine, not in this repo
+   (ForwardKdaMixer in the blas backend; kdaRecurrenceValueParallel in SYCL).
+   See the ENGINE-SIDE section below.
+   Location: tf/tfprocess.py, class KDARecurrence (~L139-232).
+
+
+DELIBERATE DEVIATIONS FROM FLA
+------------------------------
+
+A. NO SHORT CONVOLUTION.
+   FLA's KDA layer defaults to use_short_conv=True with conv_size=4 applied to
+   q/k/v. Our implementation goes straight from the dense projections (wq/wk/wv)
+   into the recurrence. (Conv1D calls do appear in tf/tempCodeRunnerFile.py, but
+   that file is a dead scratch copy and is not part of the live model.)
+
+B. NO FusedRMSNormGated OUTPUT NORM.
+   FLA normalizes the recurrence output with a gated RMSNorm. Ours uses a plain
+   low-rank sigmoid output gate: gate_a -> gate_b -> sigmoid, multiplied
+   elementwise into the mixed output, then the final dense projection.
+   tf/net.py hard-writes `encoder.kda.output_rms_norm = False` (~L104), and the
+   choice is documented in docs/model-design.md section 5 ("Older experimental KDA
+   nets used internal RMSNorm. The trainer no longer ...").
+
+C. NO allow_neg_eigval.
+   beta = sigmoid(...) only; we never use the 2 * sigmoid(...) variant that admits
+   negative eigenvalues in the delta rule.
+
+
+CHESS-SPECIFIC ADDITION (beyond FLA)
+------------------------------------
+
+A chess position is not a causal sequence, so the 64 squares are scanned in four
+fixed board traversal orders rather than one:
+    rank_forward, rank_reverse, file_forward, file_reverse
+Heads are split evenly across the enabled directions (encoder_heads must be
+divisible by the number of directions). Each head group is gathered into its own
+traversal order, all groups are concatenated, and a SINGLE recurrence call runs
+over the whole thing -- so the scan executes once, not once per direction. The
+outputs are then scattered back with tf.argsort(order).
+Location: tf/tfprocess.py, KDA_TRAVERSALS (~L88-97) and the KDA mixer (~L1988-2012).
+
+
+CONFIG SURFACE
+--------------
+  encoder_mixer_pattern : e.g. [kda, kda, kda, mha]  (3:1 KDA-to-MHA)
+  kda_key_dim           : default 32
+  kda_value_dim         : default 32
+  kda_gate_rank         : default 32
+  kda_directions        : list of the four traversal names
+  kda_output_gate       : default true
+
+Validated in TFProcess.__init__: mixer names restricted to {mha, kda};
+encoder_heads divisible by len(kda_directions); no duplicate directions;
+all three KDA dims strictly positive.
+
+
+VERIFICATION
+------------
+tf/tests/test_kda.py checks the chunkwise-parallel KDARecurrence against a naive
+NumPy token-by-token gated delta rule (with the same L2 normalization and
+1/sqrt(key_dim) scaling) to rtol/atol 1e-5.
+
+
+ENGINE-SIDE (SYCL) IMPLEMENTATION -- lc0 repo, not this workspace
+----------------------------------------------------------------
+The inference counterpart lives in the lc0 engine checkout
+(C:\Users\Contrad\Documents\Code\repos\lc0\master). Confirmed parity:
+
+  1. Per-dimension gating
+     raw_decay is projected to key_depth (heads * key_dim) and processed
+     per-dimension inside the value-parallel kernel.
+
+  2. In-kernel L2 normalization
+     q_norm / k_norm are computed on the fly per token directly inside
+     kdaRecurrenceValueParallel -- genuinely in-kernel, matching FLA's Triton
+     approach more literally than the TF side does.
+
+  3. Safe gate mode
+     Log decay bounded by kKdaLogDecayFloor = -10.0f, via
+     sycl::fmax(-decay_scale * softplus, -10.0f). Same floor as
+     KDA_LOG_DECAY_FLOOR in the trainer, so the two agree numerically.
+
+  4. Learnable temporal dynamics
+     a_log (head-wise scale) and dt_bias (per-dimension bias) are loaded from the
+     net and evaluated in-kernel.
+
+  5. Fused recurrent mode
+     Value-parallel formulation with 32-register-resident state, giving
+     sub-millisecond inference during MCTS. This is the second of FLA's two
+     execution modes; together with the trainer's chunk mode, both are covered.
+
+Deviations, mirrored on the engine side:
+
+  A. No short convolution -- projects straight from Wq/Wk/Wv into the recurrence
+     kernel, no 1D convolution pre-pass.
+  B. No FusedRMSNormGated -- output_rms_norm = False. The low-rank sigmoid gate is
+     folded into the recurrence kernel epilogue:
+         output *= 1.0f / (1.0f + sycl::exp(-gate_value));
+  C. Standard sigmoid beta --
+         update_rate = 1.0f / (1.0f + sycl::exp(-beta_value));
+     range [0, 1], no allow_neg_eigval / negative eigenvalues.
+
+Multi-directional traversals (src/.../common_kernels.dp.cpp):
+Heads are partitioned evenly across the 4 directions and the token -> square
+mapping is computed on the fly per head group, so no permutation buffers are
+materialized:
+
+    const int direction_index = head / (heads / direction_count);
+    int direction = (direction_index == 0) ? d0
+                  : (direction_index == 1) ? d1
+                  : (direction_index == 2) ? d2 : d3;
+    int square = token;
+    if (direction == 2) {
+      square = 63 - token;                        // rank reverse
+    } else if (direction == 3) {
+      square = (token % 8) * 8 + token / 8;       // file forward (transpose)
+    } else if (direction == 4) {
+      const int reverse = 63 - token;
+      square = (reverse % 8) * 8 + reverse / 8;   // file reverse
+    }
+
+This is the inverse-permutation counterpart of the trainer's KDA_TRAVERSALS
+gather/argsort pairing, and the direction ordering is carried in the net via
+NetworkFormat.kda_directions (set by tf/net.py set_kda_directions).
+
+Conclusion: trainer and SYCL engine agree on all five FLA core features, all
+three deviations, and the chess-specific traversal scheme.

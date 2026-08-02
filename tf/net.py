@@ -14,6 +14,8 @@ LC0_MINOR_WITH_INPUT_TYPE_5 = 27
 LC0_MINOR_WITH_MISH = 29
 LC0_MINOR_WITH_ATTN_BODY = 30
 LC0_MINOR_WITH_MULTIHEAD = 31
+LC0_MINOR_WITH_KDA = 32
+LC0_MINOR_WITH_KDA_NO_RMS_NORM = 33
 LC0_PATCH = 0
 WEIGHTS_MAGIC = 0x1c0
 
@@ -67,6 +69,41 @@ class Net:
         if net == pb.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT \
                 and self.pb.min_version.minor < LC0_MINOR_WITH_MULTIHEAD:
             self.pb.min_version.minor = LC0_MINOR_WITH_MULTIHEAD
+        if net == pb.NetworkFormat.NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT \
+                and self.pb.min_version.minor < LC0_MINOR_WITH_KDA:
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA
+
+    def set_kda_directions(self, directions):
+        direction_values = {
+            "rank_forward": pb.NetworkFormat.KDA_DIRECTION_RANK_FORWARD,
+            "rank_reverse": pb.NetworkFormat.KDA_DIRECTION_RANK_REVERSE,
+            "file_forward": pb.NetworkFormat.KDA_DIRECTION_FILE_FORWARD,
+            "file_reverse": pb.NetworkFormat.KDA_DIRECTION_FILE_REVERSE,
+        }
+        del self.pb.format.network_format.kda_directions[:]
+        self.pb.format.network_format.kda_directions.extend(
+            direction_values[direction] for direction in directions)
+
+    def set_encoder_mixer(self, encoder_index, mixer, key_dim=None,
+                          value_dim=None, gate_rank=None, output_gate=None):
+        while encoder_index >= len(self.pb.weights.encoder):
+            self.pb.weights.encoder.add()
+        encoder = self.pb.weights.encoder[encoder_index]
+        if mixer == "mha":
+            encoder.mixer = pb.Weights.EncoderLayer.MIXER_MHA
+            return
+        if mixer != "kda":
+            raise ValueError("Unknown encoder mixer: {}".format(mixer))
+
+        encoder.mixer = pb.Weights.EncoderLayer.MIXER_KDA
+        encoder.kda.key_dim = key_dim
+        encoder.kda.value_dim = value_dim
+        encoder.kda.gate_rank = gate_rank
+        encoder.kda.output_gate = output_gate
+        # The protobuf default is true, so this must be written explicitly.
+        encoder.kda.output_rms_norm = False
+        if self.pb.min_version.minor < LC0_MINOR_WITH_KDA_NO_RMS_NORM:
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_NO_RMS_NORM
 
     def set_policyformat(self, policy):
         self.pb.format.network_format.policy = policy
@@ -404,6 +441,23 @@ class Net:
 
             return s[l].format(d[w])
 
+        def kda_to_bp(l, w):
+            layer = l.split(':')[0]
+            if layer in ('a_log', 'dt_bias'):
+                return layer
+            if layer in ('wq', 'wk', 'wv', 'decay_a', 'decay_b',
+                         'beta', 'gate_a', 'gate_b', 'dense'):
+                weight = w.split(':')[0]
+                suffix = {'kernel': 'w', 'bias': 'b'}
+                if weight not in suffix:
+                    raise ValueError(
+                        'Unable to decode KDA weight {}/{}'.format(l, w))
+                pb_layer = {'wq': 'q', 'wk': 'k', 'wv': 'v'}.get(
+                    layer, layer)
+                return '{}_{}'.format(pb_layer, suffix[weight])
+            raise ValueError(
+                'Unable to decode KDA weight {}/{}'.format(l, w))
+
         def ffn_to_bp(l, w):
             w = w.split(':')[0]
             d = {'kernel': '{}_w', 'bias': '{}_b'}
@@ -490,6 +544,8 @@ class Net:
                         layers[3], weights_name)
                 else:
                     pb_name = 'mha.' + mha_to_bp(layers[2], weights_name)
+            elif layers[1] == 'kda':
+                pb_name = 'kda.' + kda_to_bp(layers[2], weights_name)
             elif layers[1] == 'ffn':
                 pb_name = 'ffn.' + ffn_to_bp(layers[2], weights_name)
             else:
@@ -664,7 +720,8 @@ class Net:
                 # Leela
                 # [output, input, filter_size, filter_size]
                 weights = np.transpose(weights, axes=[3, 2, 0, 1])
-            elif weights.ndim == 2:
+            elif weights.ndim == 2 and not (
+                    '/kda/a_log:' in name or '/kda/dt_bias:' in name):
                 # Fully connected layers are [in, out] in TF
                 #
                 # [out, in] in Leela

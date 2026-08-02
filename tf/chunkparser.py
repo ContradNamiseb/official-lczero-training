@@ -629,6 +629,10 @@ class ChunkParserInner:
                 # add 48 byes of fake result_q, result_d etc
                 record += 48 * b"\x00"
 
+            if version != V7_VERSION:
+                record += b"\x00" * (self.v7_struct.size - len(record))
+            assert len(record) == self.v7_struct.size
+
             if version == V6_VERSION or version == V7_VERSION:
                 # diff focus code, peek at best_q, orig_q and pol_kld from record (unpacks as tuple with one item)
                 best_q = struct.unpack("f", record[8284:8288])[0]
@@ -832,6 +836,19 @@ class ChunkParserTest(unittest.TestCase):
         Test struct size
         """
         self.assertEqual(self.v4_struct.size, 8292)
+
+    def test_legacy_record_is_padded_for_v7_shuffle(self):
+        truth = self.generate_fake_pos()
+        inner = ChunkParserInner.__new__(ChunkParserInner)
+        inner.init_structs()
+        inner.sample = 1
+
+        records = list(inner.sample_record(self.v4_record(*truth)))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]), inner.v7_struct.size)
+        self.assertEqual(records[0][:4], V4_VERSION)
+        inner.v7_struct.unpack(records[0])
 
     def test_parsing(self):
         """

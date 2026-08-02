@@ -29,9 +29,32 @@ from functools import reduce
 import operator
 import functools
 from net import Net
-import tensorflow_models as tfm
+
+try:
+    import tensorflow_models as tfm
+except ImportError:
+    tfm = None
 
 from keras import backend as K
+
+
+def accelerator_device_type():
+    """Return the device type this build exposes accelerators under.
+
+    Intel Extension for TensorFlow registers Intel GPUs as PluggableDevices of
+    type ``XPU``; CUDA, ROCm and DirectML builds all use ``GPU``.
+    """
+    if tf.config.list_physical_devices('XPU'):
+        return 'XPU'
+    return 'GPU'
+
+
+def enable_memory_growth(device):
+    # ITEX manages device memory itself and rejects this request.
+    try:
+        tf.config.experimental.set_memory_growth(device, True)
+    except (ValueError, tf.errors.UnimplementedError) as error:
+        print(f"Memory growth unavailable for {device.name}: {error}")
 
 
 def get_activation(activation):
@@ -81,22 +104,154 @@ def square_relu(x):
     return tf.nn.relu(x) ** 2
 
 
-class RMSNorm(tf.keras.layers.Layer):
-    def __init__(self, scale=True, **kwargs):
-        super(RMSNorm, self).__init__(**kwargs)
-        self.scale = scale
+KDA_TRAVERSALS = {
+    "rank_forward": tuple(range(64)),
+    "rank_reverse": tuple(reversed(range(64))),
+    "file_forward": tuple(
+        rank * 8 + file for file in range(8) for rank in range(8)),
+    "file_reverse": tuple(
+        reversed(tuple(
+            rank * 8 + file for file in range(8) for rank in range(8)))),
+}
+
+# Tokens per chunk of the parallel KDA recurrence; 64 squares become 4 chunks.
+# Measured fastest of 4/8/16/32/64 on DirectML: bigger chunks trade extra dense
+# work for less sequential depth, and 16 sits at the turning point.
+KDA_CHUNK_SIZE = 16
+# Per-token log decay floor. The parallel form needs exp(+/- cumulative/2) to
+# stay in the float32 exponent range, which caps this at 176 / KDA_CHUNK_SIZE.
+# Retaining exp(-10) of the state per token is already indistinguishable from
+# total forgetting, so lc0's unclamped sequential recurrence still matches.
+KDA_LOG_DECAY_FLOOR = -10.0
+
+
+class KDALogDecay(tf.keras.layers.Layer):
+    def __init__(self, heads, key_dim, **kwargs):
+        super(KDALogDecay, self).__init__(**kwargs)
+        self.heads = heads
+        self.key_dim = key_dim
 
     def build(self, input_shape):
-        self.gamma = self.add_weight(name="gamma",
-                                     shape=[input_shape[-1]],
-                                     initializer="ones",
-                                     constraint=tf.keras.constraints.NonNeg(),
-                                     trainable=True) if self.scale else 1
+        a_log = np.log(np.linspace(1.0, 16.0, self.heads,
+                                   dtype=np.float32))[:, None]
+        initial_dt = np.exp(np.linspace(
+            np.log(0.001), np.log(0.1), self.key_dim,
+            dtype=np.float32))
+        dt_bias = np.log(np.expm1(initial_dt))[None, :]
+        dt_bias = np.repeat(dt_bias, self.heads, axis=0)
+        self.a_log = self.add_weight(
+            name="a_log", shape=[self.heads, 1],
+            initializer=tf.constant_initializer(a_log), trainable=True)
+        self.dt_bias = self.add_weight(
+            name="dt_bias", shape=[self.heads, self.key_dim],
+            initializer=tf.constant_initializer(dt_bias), trainable=True)
+
+    def call(self, raw_decay):
+        raw_decay = tf.cast(raw_decay, tf.float32)
+        a_log = tf.cast(self.a_log, tf.float32)
+        dt_bias = tf.cast(self.dt_bias, tf.float32)
+        return (-tf.exp(a_log)[None, None, :, :] *
+                tf.nn.softplus(
+                    raw_decay + dt_bias[None, None, :, :]))
+
+
+class KDARecurrence(tf.keras.layers.Layer):
+    """Chunkwise-parallel form of the gated delta rule.
+
+    Equivalent to scanning the recurrence one token at a time, but each chunk is
+    solved in closed form with dense matmuls, so the sequential depth drops from
+    `tokens` to `tokens / KDA_CHUNK_SIZE`.
+    """
 
     def call(self, inputs):
-        factor = tf.math.rsqrt(tf.reduce_mean(
-            tf.square(inputs), axis=-1, keepdims=True) + 1e-5)
-        return inputs * factor * self.gamma
+        q, k, v, log_decay, beta = inputs
+        q = tf.math.l2_normalize(tf.cast(q, tf.float32), axis=-1)
+        k = tf.math.l2_normalize(tf.cast(k, tf.float32), axis=-1)
+        v = tf.cast(v, tf.float32)
+        log_decay = tf.maximum(
+            tf.cast(log_decay, tf.float32), KDA_LOG_DECAY_FLOOR)
+        beta = tf.cast(beta, tf.float32)[..., None]
+
+        tokens, heads, key_dim = q.shape[1], q.shape[2], q.shape[3]
+        value_dim = v.shape[3]
+        chunk = KDA_CHUNK_SIZE
+        padding = -tokens % chunk
+        if padding:
+            # Zero keys and betas make padded tokens leave the state untouched.
+            pad4 = [[0, 0], [0, padding], [0, 0], [0, 0]]
+            q = tf.pad(q, pad4)
+            k = tf.pad(k, pad4)
+            v = tf.pad(v, pad4)
+            log_decay = tf.pad(log_decay, pad4)
+            beta = tf.pad(beta, pad4)
+        chunks = (tokens + padding) // chunk
+        batch = tf.shape(q)[0]
+
+        def to_chunks(x, depth):
+            x = tf.reshape(x, [batch, chunks, chunk, heads, depth])
+            return tf.transpose(x, [0, 1, 3, 2, 4])
+
+        q = to_chunks(q, key_dim)
+        k = to_chunks(k, key_dim)
+        v = to_chunks(v, value_dim)
+        log_decay = to_chunks(log_decay, key_dim)
+        beta = to_chunks(beta, 1)
+
+        cumulative = tf.cumsum(log_decay, axis=3)
+        final = cumulative[:, :, :, -1:, :]
+        # Splitting the decay symmetrically about the chunk midpoint keeps both
+        # factors of exp(cumulative_i - cumulative_j) inside the float32 range.
+        half = 0.5 * final
+        decayed_q = q * tf.exp(cumulative)
+        decayed_k = k * tf.exp(cumulative)
+        trailing_k = k * tf.exp(final - cumulative)
+        centered = tf.exp(cumulative - half)
+        uncentered = k * tf.exp(half - cumulative)
+
+        rows = tf.range(chunk)[:, None]
+        columns = tf.range(chunk)[None, :]
+        zero = tf.constant(0.0, tf.float32)
+        key_attn = tf.where(
+            rows > columns,
+            tf.einsum("bnhck,bnhdk->bnhcd", k * centered, uncentered), zero)
+        query_attn = tf.where(
+            rows >= columns,
+            tf.einsum("bnhck,bnhdk->bnhcd", q * centered, uncentered), zero)
+
+        # Invert the unit lower triangular (I + diag(beta) @ key_attn) with a
+        # Neumann series; key_attn is strictly lower triangular, so it is
+        # nilpotent and the series is exact after `chunk` terms.
+        nilpotent = -beta * key_attn
+        identity = tf.eye(chunk, dtype=tf.float32)
+        inverse = identity + nilpotent
+        power = nilpotent
+        span = 2
+        while span < chunk:
+            power = tf.matmul(power, power)
+            inverse = tf.matmul(inverse, identity + power)
+            span *= 2
+
+        beta_v = beta * v
+        beta_k = beta * decayed_k
+        final_decay = tf.transpose(tf.exp(final), [0, 1, 2, 4, 3])
+
+        state = tf.zeros([batch, heads, key_dim, value_dim], tf.float32)
+        outputs = []
+        for index in range(chunks):
+            delta = tf.matmul(
+                inverse[:, index],
+                beta_v[:, index] - tf.matmul(beta_k[:, index], state))
+            outputs.append(tf.matmul(decayed_q[:, index], state) +
+                           tf.matmul(query_attn[:, index], delta))
+            state = state * final_decay[:, index] + tf.matmul(
+                trailing_k[:, index], delta, transpose_a=True)
+
+        outputs = tf.stack(outputs, axis=1) * tf.math.rsqrt(
+            tf.cast(key_dim, tf.float32))
+        outputs = tf.transpose(outputs, [0, 1, 3, 2, 4])
+        outputs = tf.reshape(
+            outputs, [batch, chunks * chunk, heads, value_dim])
+        return outputs[:, :tokens]
 
 
 class ApplyAttentionPolicyMap(tf.keras.layers.Layer):
@@ -176,6 +331,50 @@ class TFProcess:
         self.encoder_layers = self.cfg["model"]["encoder_layers"]
         self.encoder_heads = self.cfg["model"]["encoder_heads"]
         self.encoder_d_model = self.cfg["model"].get("encoder_d_model")
+        self.encoder_mixer_pattern = self.cfg["model"].get(
+            "encoder_mixer_pattern", ["mha"])
+        self.kda_key_dim = self.cfg["model"].get("kda_key_dim", 32)
+        self.kda_value_dim = self.cfg["model"].get("kda_value_dim", 32)
+        self.kda_gate_rank = self.cfg["model"].get("kda_gate_rank", 32)
+        self.kda_directions = self.cfg["model"].get(
+            "kda_directions",
+            ["rank_forward", "rank_reverse", "file_forward", "file_reverse"])
+        self.kda_output_gate = self.cfg["model"].get(
+            "kda_output_gate", True)
+
+        valid_mixers = {"mha", "kda"}
+        if (not isinstance(self.encoder_mixer_pattern, (list, tuple)) or
+                not self.encoder_mixer_pattern):
+            raise ValueError("encoder_mixer_pattern must be a non-empty list")
+        unknown_mixers = set(self.encoder_mixer_pattern) - valid_mixers
+        if unknown_mixers:
+            raise ValueError("Unknown encoder mixer(s): {}".format(
+                ", ".join(sorted(unknown_mixers))))
+        self.encoder_mixers = [
+            self.encoder_mixer_pattern[index % len(self.encoder_mixer_pattern)]
+            for index in range(self.encoder_layers)
+        ]
+
+        if "kda" in self.encoder_mixers:
+            valid_directions = {
+                "rank_forward", "rank_reverse",
+                "file_forward", "file_reverse"
+            }
+            if (not isinstance(self.kda_directions, (list, tuple)) or
+                    not self.kda_directions):
+                raise ValueError("kda_directions must be a non-empty list")
+            unknown_directions = set(self.kda_directions) - valid_directions
+            if unknown_directions:
+                raise ValueError("Unknown KDA direction(s): {}".format(
+                    ", ".join(sorted(unknown_directions))))
+            if len(set(self.kda_directions)) != len(self.kda_directions):
+                raise ValueError("kda_directions must not contain duplicates")
+            if self.encoder_heads % len(self.kda_directions) != 0:
+                raise ValueError(
+                    "encoder_heads must be divisible by the number of KDA directions")
+            if min(self.kda_key_dim, self.kda_value_dim,
+                   self.kda_gate_rank) <= 0:
+                raise ValueError("KDA dimensions must be positive")
         self.categorical_value_buckets = self.cfg["model"].get(
             "categorical_value_buckets", 0)
 
@@ -202,6 +401,8 @@ class TFProcess:
 
         self.soft_policy_temperature = self.cfg["model"].get(
             "soft_policy_temperature", 1.0)
+        self.value_st_scalar_loss = self.cfg["model"].get(
+            "value_st_scalar_loss", False)
 
         self.use_smolgen = self.cfg["model"].get("use_smolgen", False)
         self.use_logit_gating = self.cfg["model"].get("use_logit_gating", False)
@@ -216,8 +417,6 @@ class TFProcess:
         self.skip_first_ln = self.cfg["model"].get("skip_first_ln", False)
         self.omit_qkv_biases =  self.cfg["model"].get("omit_qkv_biases", False)
         self.omit_other_biases = self.cfg["model"].get("omit_other_biases", False)
-        self.encoder_rms_norm = self.cfg["model"].get(
-            "encoder_rms_norm", False)
 
         self.embedding_style = self.cfg["model"].get(
             "embedding_style", "new").lower()
@@ -225,17 +424,20 @@ class TFProcess:
         self.return_attn_wts = self.cfg["model"].get("return_attn_wts", False)
 
         # experiments with changing have failed
-        self.encoder_norm = RMSNorm if self.encoder_rms_norm else tf.keras.layers.LayerNormalization
+        self.encoder_norm = tf.keras.layers.LayerNormalization
 
         if precision == "single":
             self.model_dtype = tf.float32
         elif precision == "half":
             self.model_dtype = tf.float16
+        elif precision == "bfloat16":
+            self.model_dtype = tf.bfloat16
         else:
             raise ValueError("Unknown precision: {}".format(precision))
 
-        # Scale the loss to prevent gradient underflow
-        self.loss_scale = 1 if self.model_dtype == tf.float32 else loss_scale
+        # Scale the loss to prevent gradient underflow. bfloat16 keeps the
+        # float32 exponent range, so it does not need scaling.
+        self.loss_scale = loss_scale if self.model_dtype == tf.float16 else 1
 
         policy_head = self.cfg['model'].get('policy', 'attention')
         value_head = self.cfg['model'].get('value', 'wdl')
@@ -327,8 +529,20 @@ class TFProcess:
 
         if self.encoder_layers > 0:
             self.net.set_headcount(self.encoder_heads)
-            self.net.set_networkformat(
-                pb.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT)
+            if "kda" in self.encoder_mixers:
+                self.net.set_networkformat(
+                    pb.NetworkFormat.NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT)
+                self.net.set_kda_directions(self.kda_directions)
+            else:
+                self.net.set_networkformat(
+                    pb.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT)
+            for index, mixer in enumerate(self.encoder_mixers):
+                self.net.set_encoder_mixer(
+                    index, mixer,
+                    key_dim=self.kda_key_dim,
+                    value_dim=self.kda_value_dim,
+                    gate_rank=self.kda_gate_rank,
+                    output_gate=self.kda_output_gate)
             self.net.set_smolgen_activation(
                 self.net.activation(self.smolgen_activation))
             self.net.set_ffn_activation(self.net.activation(
@@ -364,31 +578,32 @@ class TFProcess:
         self.renorm_momentum = self.cfg["training"].get(
             "renorm_momentum", 0.99)
 
+        device_type = accelerator_device_type()
+        gpus = tf.config.experimental.list_physical_devices(device_type)
         if self.cfg['gpu'] == 'all':
-            gpus = tf.config.experimental.list_physical_devices('GPU')
             for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            self.strategy = tf.distribute.MirroredStrategy()
+                enable_memory_growth(gpu)
+            active_gpus = [f"{device_type}:{i}" for i in range(len(gpus))]
+            self.strategy = tf.distribute.MirroredStrategy(active_gpus or None)
             tf.distribute.experimental_set_strategy(self.strategy)
         elif "," in str(self.cfg['gpu']):
             active_gpus = []
-            gpus = tf.config.experimental.list_physical_devices('GPU')
             for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
+                enable_memory_growth(gpu)
             for i in self.cfg['gpu'].split(","):
-                active_gpus.append("GPU:" + i)
+                active_gpus.append(f"{device_type}:{i}")
             self.strategy = tf.distribute.MirroredStrategy(active_gpus)
             tf.distribute.experimental_set_strategy(self.strategy)
         else:
-            gpus = tf.config.experimental.list_physical_devices('GPU')
             print(gpus)
             tf.config.experimental.set_visible_devices(gpus[self.cfg['gpu']],
-                                                       'GPU')
-            tf.config.experimental.set_memory_growth(gpus[self.cfg['gpu']],
-                                                     True)
+                                                       device_type)
+            enable_memory_growth(gpus[self.cfg['gpu']])
             self.strategy = None
         if self.model_dtype == tf.float16:
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        elif self.model_dtype == tf.bfloat16:
+            tf.keras.mixed_precision.set_global_policy('mixed_bfloat16')
 
         self.global_step = tf.Variable(0,
                                        name='global_step',
@@ -439,9 +654,9 @@ class TFProcess:
 
 
         try:
-            flops =  tfm.core.train_utils.try_count_flops(self.model)
+            flops = tfm.core.train_utils.try_count_flops(self.model)
             print(f"FLOPS: {flops / 10 ** 9:.03} G")
-        except:
+        except (AttributeError, ImportError):
             print("keras flops module not found, won't count flops")
 
 
@@ -575,7 +790,7 @@ class TFProcess:
 
         def get_policy_optimism_weights(value_target, value_pred, value_err_pred, strength=2.0):
             # value err pred already has square root taken
-            value_pred = self.convert_val_to_scalar(value_pred)
+            value_pred = self.convert_val_to_scalar(value_pred, softmax=True)
             value_target = self.convert_val_to_scalar(value_target)
             value_err_pred = tf.math.sqrt(value_err_pred)
             z_values = (value_target - value_pred) / (value_err_pred + 1e-5)
@@ -715,8 +930,10 @@ class TFProcess:
 
         self.value_err_loss_fn = value_err_loss
 
-        def value_losses(target, output, err_output=None, cat_output=None):
-            value_loss = self.value_loss_fn(target, output)
+        def value_losses(target, output, err_output=None, cat_output=None,
+                         scalar_primary=False):
+            value_loss = (self.mse_loss_fn(target, output)
+                          if scalar_primary else self.value_loss_fn(target, output))
             value_err_loss = self.value_err_loss_fn(target, tf.stop_gradient(
                 output), err_output) if err_output is not None else tf.constant(0.)
             value_cat_loss = categorical_value_loss(
@@ -849,6 +1066,9 @@ class TFProcess:
 
         self.test_metrics.extend(accuracy_thresholded_metrics)
 
+        self.detailed_summaries = self.cfg["training"].get(
+            "detailed_summaries", True)
+
         # Set adaptive learning rate during training
         self.cfg["training"]["lr_boundaries"].sort()
         self.warmup_steps = self.cfg["training"].get("warmup_steps", 0)
@@ -949,14 +1169,20 @@ class TFProcess:
                 new_weight = tf.constant(new_weight, shape=shape)
                 weight.assign(tf.transpose(a=new_weight, perm=[2, 3, 1, 0]))
             elif weight.shape.ndims == 2:
-                # Fully connected layers are [in, out] in TF
-                #
-                # [out, in] in Leela
-                #
-                s = weight.shape.as_list()
-                shape = [s[i] for i in [1, 0]]
-                new_weight = tf.constant(new_weight, shape=shape)
-                weight.assign(tf.transpose(a=new_weight, perm=[1, 0]))
+                if ('/kda/a_log:' in weight.name or
+                        '/kda/dt_bias:' in weight.name):
+                    new_weight = tf.constant(
+                        new_weight, shape=weight.shape)
+                    weight.assign(new_weight)
+                else:
+                    # Fully connected layers are [in, out] in TF
+                    #
+                    # [out, in] in Leela
+                    #
+                    s = weight.shape.as_list()
+                    shape = [s[i] for i in [1, 0]]
+                    new_weight = tf.constant(new_weight, shape=shape)
+                    weight.assign(tf.transpose(a=new_weight, perm=[1, 0]))
             else:
                 # Biases, batchnorm etc
                 new_weight = tf.constant(new_weight, shape=weight.shape)
@@ -1084,7 +1310,8 @@ class TFProcess:
             value_q_loss, value_q_err_loss, value_q_cat_loss = self.value_losses_fn(
                 q, value_q, value_q_err, value_q_cat) if value_q is not None else (tf.constant(0.), tf.constant(0.), tf.constant(0.))
             value_st_loss, value_st_err_loss, value_st_cat_loss = self.value_losses_fn(
-                st_q, value_st, value_st_err, value_st_cat) if value_st is not None else (tf.constant(0.), tf.constant(0.), tf.constant(0.))
+                st_q, value_st, value_st_err, value_st_cat,
+                scalar_primary=self.value_st_scalar_loss) if value_st is not None else (tf.constant(0.), tf.constant(0.), tf.constant(0.))
             if self.wdl:
                 mse_loss = self.mse_loss_fn(q, value_q)
                 value_accuracy = self.accuracy_fn(q, value_q)
@@ -1198,13 +1425,17 @@ class TFProcess:
 
     def train_step(self, steps: int, batch_size: int, batch_splits: int):
         # need to add 1 to steps because steps will be incremented after gradient update
-        if (steps +
+        if self.detailed_summaries and ((steps +
                 1) % self.cfg["training"]["train_avg_report_steps"] == 0 or (
-                    steps + 1) % self.cfg["training"]["total_steps"] == 0:
+                steps + 1) % self.cfg["training"]["total_steps"] == 0):
             before_weights = self.read_weights()
 
         # Run training for this batch
         grads = None
+        # Read once: `steps` is a device tensor and syncing it per split stalls
+        # the pipeline.
+        completed = steps.numpy().item() - 1 if hasattr(
+            self, "progressbar") else 0
         for batch_id in range(batch_splits):
             x, y, z, q, m, st_q, opp_idx, next_idx = next(self.train_iter)
             if self.strategy is not None:
@@ -1225,8 +1456,9 @@ class TFProcess:
                 acc.accumulate(val)
 
             if hasattr(self, "progressbar"):
-                self.progressbar.update(self.progresstask, completed=steps.numpy(
-                ).item() - 1 + (batch_id+1) / batch_splits)
+                self.progressbar.update(
+                    self.progresstask,
+                    completed=completed + (batch_id + 1) / batch_splits)
         # Gradients of batch splits are summed, not averaged like usual, so need to scale lr accordingly to correct for this.
         effective_batch_splits = batch_splits
         if self.strategy is not None:
@@ -1269,7 +1501,6 @@ class TFProcess:
                           metric.get(), metric.suffix)
             print(" ({:g} pos/s)".format(speed))
 
-            after_weights = self.read_weights()
             with self.train_writer.as_default():
                 for metric in self.train_metrics:
                     tf.summary.scalar(metric.long_name,
@@ -1279,7 +1510,10 @@ class TFProcess:
                 tf.summary.scalar("Gradient norm",
                                   grad_norm / effective_batch_splits,
                                   step=steps)
-                self.compute_update_ratio(before_weights, after_weights, steps)
+                if self.detailed_summaries:
+                    after_weights = self.read_weights()
+                    self.compute_update_ratio(
+                        before_weights, after_weights, steps)
             self.train_writer.flush()
 
             self.time_start = time_end
@@ -1360,20 +1594,22 @@ class TFProcess:
                 print("Model saved in file: {}".format(
                     self.manager.latest_checkpoint))
 
-                # Save normal weights
-                tf.saved_model.save(self.model, os.path.join(
-                    self.root_dir, self.cfg["name"]) + str(evaled_steps))
-
-                # Save swa weights
-                if self.swa_enabled:
-                    backup = self.read_weights()
-                    for (swa, w) in zip(self.swa_weights, self.model.weights):
-                        w.assign(swa.read_value())
-                    evaled_steps = steps.numpy()
+                if not self.cfg["training"].get(
+                        "disable_saved_model_checkpointing", False):
+                    # Save normal weights
                     tf.saved_model.save(self.model, os.path.join(
-                        self.root_dir, self.cfg["name"]) + "-swa-" + str(evaled_steps))
-                    for (old, w) in zip(backup, self.model.weights):
-                        w.assign(old)
+                        self.root_dir, self.cfg["name"]) + str(evaled_steps))
+
+                    # Save swa weights
+                    if self.swa_enabled:
+                        backup = self.read_weights()
+                        for (swa, w) in zip(self.swa_weights, self.model.weights):
+                            w.assign(swa.read_value())
+                        evaled_steps = steps.numpy()
+                        tf.saved_model.save(self.model, os.path.join(
+                            self.root_dir, self.cfg["name"]) + "-swa-" + str(evaled_steps))
+                        for (old, w) in zip(backup, self.model.weights):
+                            w.assign(old)
 
                 if not self.cfg["training"].get("disable_pb_checkpointing"):  
                     path = os.path.join(self.root_dir, self.cfg["name"])
@@ -1452,13 +1688,14 @@ class TFProcess:
 
         # Value losses
         value_winner_loss, value_winner_err_loss, value_winner_cat_loss = self.value_losses_fn(
-            z, value_winner, value_winner)
+            z, value_winner, None, None)
 
         value_q_loss, value_q_err_loss, value_q_cat_loss = self.value_losses_fn(
             q, value_q, value_q_err, value_q_cat) if value_q is not None else (tf.constant(0.),) * 3
 
         value_st_loss, value_st_err_loss, value_st_cat_loss = self.value_losses_fn(
-            st_q, value_st, value_st_err, value_st_cat) if value_st is not None else (tf.constant(0.),) * 3
+            st_q, value_st, value_st_err, value_st_cat,
+            scalar_primary=self.value_st_scalar_loss) if value_st is not None else (tf.constant(0.),) * 3
 
         if self.wdl:
             mse_loss = self.mse_loss_fn(q, value_q)
@@ -1533,17 +1770,20 @@ class TFProcess:
         with self.test_writer.as_default():
             for metric in self.test_metrics:
                 tf.summary.scalar(metric.long_name, metric.get(), step=steps)
-            for w in self.model.weights:
-                tf.summary.histogram(w.name, w, step=steps)
+            if self.detailed_summaries:
+                for w in self.model.weights:
+                    tf.summary.histogram(w.name, w, step=steps)
             params = self.model.count_params() 
             smolgen_params = np.sum([K.count_params(w) for w in self.model.trainable_weights if "smol" in w.name])
             emb_params = np.sum([K.count_params(w) for w in self.model.trainable_weights if "embedding/preprocess" in w.name])
-            flops =  tfm.core.train_utils.try_count_flops(self.model)
+            flops = (tfm.core.train_utils.try_count_flops(self.model)
+                     if tfm is not None else None)
             if steps == 1:
                 tf.summary.text("Params", str(smolgen_params), step=steps)
                 tf.summary.text("Smolgen params", str(smolgen_params), step=steps)
                 tf.summary.text("Embedding params", str(emb_params), step=steps)
-                tf.summary.text("FLOPS", str(flops), step=steps)
+                if flops is not None:
+                    tf.summary.text("FLOPS", str(flops), step=steps)
 
 
         self.test_writer.flush()
@@ -1721,6 +1961,95 @@ class TFProcess:
             emb_size, name=name + "/dense", kernel_initializer=initializer, use_bias=not self.omit_other_biases)(scaled_attention)
         return output, attention_weights
 
+    def recurrent_kda(self, q, k, v, log_decay, beta, name=None):
+        output_dtype = v.dtype
+        outputs = KDARecurrence(
+            dtype=tf.float32, name=name)([q, k, v, log_decay, beta])
+        return tf.cast(outputs, output_dtype)
+
+    def kda(self, inputs, emb_size: int, num_heads: int,
+            initializer, name: str):
+        use_qkv_bias = not self.omit_qkv_biases
+        use_other_bias = not self.omit_other_biases
+        key_depth = num_heads * self.kda_key_dim
+        value_depth = num_heads * self.kda_value_dim
+        batch_size = tf.shape(inputs)[0]
+
+        q = tf.keras.layers.Dense(
+            key_depth, name=name + "/wq", kernel_initializer="glorot_normal",
+            use_bias=use_qkv_bias)(inputs)
+        k = tf.keras.layers.Dense(
+            key_depth, name=name + "/wk", kernel_initializer="glorot_normal",
+            use_bias=use_qkv_bias)(inputs)
+        v = tf.keras.layers.Dense(
+            value_depth, name=name + "/wv", kernel_initializer=initializer,
+            use_bias=use_qkv_bias)(inputs)
+
+        raw_decay = tf.keras.layers.Dense(
+            self.kda_gate_rank, name=name + "/decay_a",
+            kernel_initializer=initializer, use_bias=use_other_bias)(inputs)
+        raw_decay = tf.keras.layers.Dense(
+            key_depth, name=name + "/decay_b",
+            kernel_initializer=initializer, use_bias=use_other_bias)(raw_decay)
+        raw_decay = tf.reshape(
+            raw_decay, [batch_size, 64, num_heads, self.kda_key_dim])
+        log_decay = KDALogDecay(
+            num_heads, self.kda_key_dim, name=name)(raw_decay)
+
+        beta = tf.keras.layers.Dense(
+            num_heads, name=name + "/beta", kernel_initializer=initializer,
+            use_bias=use_other_bias)(inputs)
+        beta = tf.sigmoid(beta)
+
+        q = tf.reshape(q, [batch_size, 64, num_heads, self.kda_key_dim])
+        k = tf.reshape(k, [batch_size, 64, num_heads, self.kda_key_dim])
+        v = tf.reshape(v, [batch_size, 64, num_heads, self.kda_value_dim])
+
+        heads_per_direction = num_heads // len(self.kda_directions)
+        head_slices = [
+            slice(index * heads_per_direction,
+                  (index + 1) * heads_per_direction)
+            for index in range(len(self.kda_directions))
+        ]
+        orders = [tf.constant(KDA_TRAVERSALS[direction], dtype=tf.int32)
+                  for direction in self.kda_directions]
+
+        # All directions share one recurrence call: each head group is permuted
+        # into its own traversal order first, so the scan runs once, not once
+        # per direction.
+        ordered = self.recurrent_kda(
+            tf.concat([tf.gather(q[:, :, group, :], order, axis=1)
+                       for group, order in zip(head_slices, orders)], axis=2),
+            tf.concat([tf.gather(k[:, :, group, :], order, axis=1)
+                       for group, order in zip(head_slices, orders)], axis=2),
+            tf.concat([tf.gather(v[:, :, group, :], order, axis=1)
+                       for group, order in zip(head_slices, orders)], axis=2),
+            tf.concat([tf.gather(log_decay[:, :, group, :], order, axis=1)
+                       for group, order in zip(head_slices, orders)], axis=2),
+            tf.concat([tf.gather(beta[:, :, group], order, axis=1)
+                       for group, order in zip(head_slices, orders)], axis=2),
+            name=name + "/scan")
+
+        mixed = tf.concat(
+            [tf.gather(ordered[:, :, group, :], tf.argsort(order), axis=1)
+             for group, order in zip(head_slices, orders)], axis=2)
+        mixed = tf.reshape(mixed, [batch_size, 64, value_depth])
+
+        if self.kda_output_gate:
+            gate = tf.keras.layers.Dense(
+                self.kda_gate_rank, name=name + "/gate_a",
+                kernel_initializer=initializer,
+                use_bias=use_other_bias)(inputs)
+            gate = tf.keras.layers.Dense(
+                value_depth, name=name + "/gate_b",
+                kernel_initializer=initializer,
+                use_bias=use_other_bias)(gate)
+            mixed = mixed * tf.cast(tf.sigmoid(gate), mixed.dtype)
+
+        return tf.keras.layers.Dense(
+            emb_size, name=name + "/dense", kernel_initializer=initializer,
+            use_bias=use_other_bias)(mixed)
+
     # 2-layer dense feed-forward network in encoder blocks
     def ffn(self, inputs, emb_size: int, dff: int, initializer, name: str):
         if isinstance(self.ffn_activation, str):
@@ -1735,7 +2064,7 @@ class TFProcess:
             emb_size, name=name + "/dense2", kernel_initializer=initializer, use_bias=not self.omit_other_biases)(dense1)
         return out
 
-    def encoder_layer(self, inputs, emb_size: int, d_model: int, num_heads: int, dff: int, name: str, training: bool):
+    def encoder_layer(self, inputs, emb_size: int, d_model: int, num_heads: int, dff: int, name: str, training: bool, mixer_type: str = "mha"):
         # DeepNorm
         alpha = tf.cast(tf.math.pow(
             2. * self.encoder_layers, 0.25), self.model_dtype)
@@ -1746,9 +2075,17 @@ class TFProcess:
         xavier_norm = tf.keras.initializers.VarianceScaling(
             scale=beta, mode="fan_avg", distribution="truncated_normal", seed=42)
 
-        # multihead attention
-        attn_output, attn_wts = self.mha(
-            inputs, emb_size, d_model, num_heads, xavier_norm, name=name + "/mha")
+        if mixer_type == "mha":
+            attn_output, attn_wts = self.mha(
+                inputs, emb_size, d_model, num_heads, xavier_norm,
+                name=name + "/mha")
+        elif mixer_type == "kda":
+            attn_output = self.kda(
+                inputs, emb_size, num_heads, xavier_norm,
+                name=name + "/kda")
+            attn_wts = None
+        else:
+            raise ValueError("Unknown encoder mixer: {}".format(mixer_type))
 
         # dropout for weight regularization
         attn_output = tf.keras.layers.Dropout(
@@ -1863,10 +2200,13 @@ class TFProcess:
 
         attn_wts = []
         for i in range(self.encoder_layers):
+            mixer_type = self.encoder_mixers[i]
             flow, attn_wts_l = self.encoder_layer(flow, self.embedding_size, self.encoder_d_model,
                                                   self.encoder_heads, self.encoder_dff,
-                                                  name=name+"encoder_{}".format(i + 1), training=True)
-            attn_wts.append(attn_wts_l)
+                                                  name=name+"encoder_{}".format(i + 1), training=True,
+                                                  mixer_type=mixer_type)
+            if attn_wts_l is not None:
+                attn_wts.append(attn_wts_l)
 
         flow_ = flow
 
@@ -2003,7 +2343,7 @@ class TFProcess:
             return value, value_err, value_cat
 
         value_winner, value_winner_err, value_winner_cat = value_head(
-            name="value/winner", wdl=self.wdl, use_err=False)
+            name="value/winner", wdl=self.wdl, use_err=False, use_cat=False)
         value_q, value_q_err, value_q_cat = value_head(
             name="value/q", wdl=self.wdl, use_err=True) if self.cfg['model'].get('value_q', False) else (None, None, None)
         value_st, value_st_err, value_st_cat = value_head(
@@ -2048,7 +2388,7 @@ class TFProcess:
             "moves_left": moves_left,
         }
 
-        if self.return_attn_wts:
+        if self.return_attn_wts and attn_wts:
             outputs["attn_wts"] = attn_wts
 
         # Tensorflow does not accept None values in the output dictionary

@@ -97,8 +97,7 @@ model:
 
     use_logit_gating: false
 
-    omit_qkv_biases: true # these two increases training speed by ~10% on BT4 
-    encoder_rms_norm: true # without quality degradation
+    omit_qkv_biases: true # increases training speed by ~10% on BT4
 
     policy_optimistic_st: true
     policy_opponent: false

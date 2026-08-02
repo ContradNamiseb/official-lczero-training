@@ -1,0 +1,8 @@
+numpy<1.24
+protobuf==3.19.6
+grpcio-tools==1.44.0
+pyyaml
+rich
+tensorflow-addons==0.18.0
+tensorflow-cpu==2.10
+tensorflow-directml-plugin==0.4.0.dev230202
