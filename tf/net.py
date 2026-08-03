@@ -17,6 +17,7 @@ LC0_MINOR_WITH_MULTIHEAD = 31
 LC0_MINOR_WITH_KDA = 32
 LC0_MINOR_WITH_KDA_NO_RMS_NORM = 33
 LC0_MINOR_WITH_KDA_8_DIRECTION = 34
+LC0_MINOR_WITH_KDA_LOCAL_CONV = 35
 LC0_PATCH = 0
 WEIGHTS_MAGIC = 0x1c0
 
@@ -99,7 +100,8 @@ class Net:
             self.pb.min_version.minor = LC0_MINOR_WITH_KDA_8_DIRECTION
 
     def set_encoder_mixer(self, encoder_index, mixer, key_dim=None,
-                          value_dim=None, gate_rank=None, output_gate=None):
+                          value_dim=None, gate_rank=None, output_gate=None,
+                          local_conv=False):
         while encoder_index >= len(self.pb.weights.encoder):
             self.pb.weights.encoder.add()
         encoder = self.pb.weights.encoder[encoder_index]
@@ -118,6 +120,10 @@ class Net:
         encoder.kda.output_rms_norm = False
         if self.pb.min_version.minor < LC0_MINOR_WITH_KDA_NO_RMS_NORM:
             self.pb.min_version.minor = LC0_MINOR_WITH_KDA_NO_RMS_NORM
+        encoder.kda.local_conv = local_conv
+        if (local_conv and
+                self.pb.min_version.minor < LC0_MINOR_WITH_KDA_LOCAL_CONV):
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_LOCAL_CONV
 
     def set_policyformat(self, policy):
         self.pb.format.network_format.policy = policy
@@ -469,6 +475,13 @@ class Net:
                 pb_layer = {'wq': 'q', 'wk': 'k', 'wv': 'v'}.get(
                     layer, layer)
                 return '{}_{}'.format(pb_layer, suffix[weight])
+            if layer == 'local_conv':
+                weight = w.split(':')[0]
+                suffix = {'depthwise_kernel': 'w', 'bias': 'b'}
+                if weight not in suffix:
+                    raise ValueError(
+                        'Unable to decode KDA weight {}/{}'.format(l, w))
+                return 'local_conv_{}'.format(suffix[weight])
             raise ValueError(
                 'Unable to decode KDA weight {}/{}'.format(l, w))
 

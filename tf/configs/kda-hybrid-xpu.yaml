@@ -146,6 +146,10 @@ model:
     # This replaces FLA's gated RMSNorm; leave on unless you are deliberately
     # training an ungated variant.
     kda_output_gate: true
+    # Local 3x3 depthwise conv over the 8x8 board before each KDA layer's
+    # projections, so bishop/queen/pawn-capture (diagonal) neighbors are seen
+    # before the linear scan runs. Per Review-Arch-KDA.pdf.
+    kda_local_conv: true
 
     # ---- Policy head ----------------------------------------------------
     # Width of the policy attention projection. Defaults to embedding_size.

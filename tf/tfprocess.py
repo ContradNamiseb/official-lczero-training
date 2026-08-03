@@ -376,6 +376,10 @@ class TFProcess:
              "anti_diag_forward", "anti_diag_reverse"])
         self.kda_output_gate = self.cfg["model"].get(
             "kda_output_gate", True)
+        # Local 3x3 depthwise conv over the 8x8 board before the mixer's q/k/v
+        # projections, so immediate (including diagonal) neighbors are seen
+        # before the linear scan runs. See Review-Arch-KDA.pdf section 1/2.
+        self.kda_local_conv = self.cfg["model"].get("kda_local_conv", False)
 
         valid_mixers = {"mha", "kda"}
         if (not isinstance(self.encoder_mixer_pattern, (list, tuple)) or
@@ -579,7 +583,8 @@ class TFProcess:
                     key_dim=self.kda_key_dim,
                     value_dim=self.kda_value_dim,
                     gate_rank=self.kda_gate_rank,
-                    output_gate=self.kda_output_gate)
+                    output_gate=self.kda_output_gate,
+                    local_conv=self.kda_local_conv)
             self.net.set_smolgen_activation(
                 self.net.activation(self.smolgen_activation))
             self.net.set_ffn_activation(self.net.activation(
@@ -2012,6 +2017,17 @@ class TFProcess:
         key_depth = num_heads * self.kda_key_dim
         value_depth = num_heads * self.kda_value_dim
         batch_size = tf.shape(inputs)[0]
+
+        if self.kda_local_conv:
+            # Squares are token-major (rank * 8 + file), matching rank_forward,
+            # so this reshape lines up with the board without any gather.
+            grid = tf.reshape(inputs, [batch_size, 8, 8, emb_size])
+            conv = tf.keras.layers.DepthwiseConv2D(
+                kernel_size=3, padding="same",
+                depthwise_initializer=initializer,
+                use_bias=use_other_bias,
+                name=name + "/local_conv")(grid)
+            inputs = inputs + tf.reshape(conv, [batch_size, 64, emb_size])
 
         q = tf.keras.layers.Dense(
             key_depth, name=name + "/wq", kernel_initializer="glorot_normal",
