@@ -160,8 +160,12 @@ class KDARecurrence(tf.keras.layers.Layer):
 
     Equivalent to scanning the recurrence one token at a time, but each chunk is
     solved in closed form with dense matmuls, so the sequential depth drops from
-    `tokens` to `tokens / KDA_CHUNK_SIZE`.
+    `tokens` to `tokens / chunk_size`.
     """
+
+    def __init__(self, chunk_size=KDA_CHUNK_SIZE, **kwargs):
+        super(KDARecurrence, self).__init__(**kwargs)
+        self.chunk_size = chunk_size
 
     def call(self, inputs):
         q, k, v, log_decay, beta = inputs
@@ -174,7 +178,7 @@ class KDARecurrence(tf.keras.layers.Layer):
 
         tokens, heads, key_dim = q.shape[1], q.shape[2], q.shape[3]
         value_dim = v.shape[3]
-        chunk = KDA_CHUNK_SIZE
+        chunk = self.chunk_size
         padding = -tokens % chunk
         if padding:
             # Zero keys and betas make padded tokens leave the state untouched.
@@ -336,6 +340,10 @@ class TFProcess:
         self.kda_key_dim = self.cfg["model"].get("kda_key_dim", 32)
         self.kda_value_dim = self.cfg["model"].get("kda_value_dim", 32)
         self.kda_gate_rank = self.cfg["model"].get("kda_gate_rank", 32)
+        # Best chunk size is backend-specific; 16 was measured fastest on
+        # DirectML. Tune per backend with tests/bench_mixers.py.
+        self.kda_chunk_size = self.cfg["model"].get(
+            "kda_chunk_size", KDA_CHUNK_SIZE)
         self.kda_directions = self.cfg["model"].get(
             "kda_directions",
             ["rank_forward", "rank_reverse", "file_forward", "file_reverse"])
@@ -1964,6 +1972,7 @@ class TFProcess:
     def recurrent_kda(self, q, k, v, log_decay, beta, name=None):
         output_dtype = v.dtype
         outputs = KDARecurrence(
+            chunk_size=self.kda_chunk_size,
             dtype=tf.float32, name=name)([q, k, v, log_decay, beta])
         return tf.cast(outputs, output_dtype)
 
