@@ -83,6 +83,10 @@ model:
         - rank_reverse
         - file_forward
         - file_reverse
+        - diag_forward
+        - diag_reverse
+        - anti_diag_forward
+        - anti_diag_reverse
     kda_output_gate: true
     policy_d_model: 512
     policy_d_aux: 512

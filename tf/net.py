@@ -16,6 +16,7 @@ LC0_MINOR_WITH_ATTN_BODY = 30
 LC0_MINOR_WITH_MULTIHEAD = 31
 LC0_MINOR_WITH_KDA = 32
 LC0_MINOR_WITH_KDA_NO_RMS_NORM = 33
+LC0_MINOR_WITH_KDA_8_DIRECTION = 34
 LC0_PATCH = 0
 WEIGHTS_MAGIC = 0x1c0
 
@@ -79,10 +80,23 @@ class Net:
             "rank_reverse": pb.NetworkFormat.KDA_DIRECTION_RANK_REVERSE,
             "file_forward": pb.NetworkFormat.KDA_DIRECTION_FILE_FORWARD,
             "file_reverse": pb.NetworkFormat.KDA_DIRECTION_FILE_REVERSE,
+            "diag_forward": pb.NetworkFormat.KDA_DIRECTION_DIAG_FORWARD,
+            "diag_reverse": pb.NetworkFormat.KDA_DIRECTION_DIAG_REVERSE,
+            "anti_diag_forward":
+                pb.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_FORWARD,
+            "anti_diag_reverse":
+                pb.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_REVERSE,
+        }
+        diagonal_directions = {
+            "diag_forward", "diag_reverse",
+            "anti_diag_forward", "anti_diag_reverse",
         }
         del self.pb.format.network_format.kda_directions[:]
         self.pb.format.network_format.kda_directions.extend(
             direction_values[direction] for direction in directions)
+        if (diagonal_directions.intersection(directions) and
+                self.pb.min_version.minor < LC0_MINOR_WITH_KDA_8_DIRECTION):
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_8_DIRECTION
 
     def set_encoder_mixer(self, encoder_index, mixer, key_dim=None,
                           value_dim=None, gate_rank=None, output_gate=None):

@@ -163,7 +163,7 @@ class KDATest(unittest.TestCase):
                 process = make_process()
                 inputs = tf.keras.Input(shape=[64, 16])
                 outputs = process.kda(
-                    inputs, emb_size=16, num_heads=4,
+                    inputs, emb_size=16, num_heads=8,
                     initializer="glorot_normal", name="encoder_1/kda")
                 model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
@@ -189,7 +189,7 @@ class KDATest(unittest.TestCase):
         process = make_process()
         inputs = tf.keras.Input(shape=[64, 16])
         outputs = process.kda(
-            inputs, emb_size=16, num_heads=4,
+            inputs, emb_size=16, num_heads=8,
             initializer="glorot_normal", name="encoder_1/kda")
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
@@ -219,12 +219,12 @@ class KDATest(unittest.TestCase):
         self.assertEqual(
             encoder.mixer, pb.Weights.EncoderLayer.MIXER_KDA)
         self.assertEqual(
-            list(network_format.kda_directions), [1, 2, 3, 4])
+            list(network_format.kda_directions), [1, 2, 3, 4, 5, 6, 7, 8])
         self.assertEqual(
             (encoder.kda.key_dim, encoder.kda.value_dim,
              encoder.kda.gate_rank), (4, 4, 4))
         self.assertFalse(encoder.kda.output_rms_norm)
-        self.assertGreaterEqual(restored_net.pb.min_version.minor, 33)
+        self.assertGreaterEqual(restored_net.pb.min_version.minor, 34)
 
         restored = restored_net.get_weights_v2(list(original))
         for name, expected in original.items():

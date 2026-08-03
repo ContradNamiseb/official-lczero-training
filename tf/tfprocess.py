@@ -112,6 +112,31 @@ KDA_TRAVERSALS = {
     "file_reverse": tuple(
         reversed(tuple(
             rank * 8 + file for file in range(8) for rank in range(8)))),
+    # Main diagonals (a1-h8 style, rank - file constant), grouped from the
+    # a8 corner to the h1 corner and walked bottom-to-top within each one.
+    "diag_forward": tuple(
+        rank * 8 + file
+        for diag in range(-7, 8)
+        for rank in range(8)
+        for file in [rank - diag] if 0 <= file < 8),
+    "diag_reverse": tuple(
+        reversed(tuple(
+            rank * 8 + file
+            for diag in range(-7, 8)
+            for rank in range(8)
+            for file in [rank - diag] if 0 <= file < 8))),
+    # Anti-diagonals (a8-h1 style, rank + file constant).
+    "anti_diag_forward": tuple(
+        rank * 8 + file
+        for diag in range(15)
+        for rank in range(8)
+        for file in [diag - rank] if 0 <= file < 8),
+    "anti_diag_reverse": tuple(
+        reversed(tuple(
+            rank * 8 + file
+            for diag in range(15)
+            for rank in range(8)
+            for file in [diag - rank] if 0 <= file < 8))),
 }
 
 # Tokens per chunk of the parallel KDA recurrence; 64 squares become 4 chunks.
@@ -346,7 +371,9 @@ class TFProcess:
             "kda_chunk_size", KDA_CHUNK_SIZE)
         self.kda_directions = self.cfg["model"].get(
             "kda_directions",
-            ["rank_forward", "rank_reverse", "file_forward", "file_reverse"])
+            ["rank_forward", "rank_reverse", "file_forward", "file_reverse",
+             "diag_forward", "diag_reverse",
+             "anti_diag_forward", "anti_diag_reverse"])
         self.kda_output_gate = self.cfg["model"].get(
             "kda_output_gate", True)
 
@@ -366,7 +393,9 @@ class TFProcess:
         if "kda" in self.encoder_mixers:
             valid_directions = {
                 "rank_forward", "rank_reverse",
-                "file_forward", "file_reverse"
+                "file_forward", "file_reverse",
+                "diag_forward", "diag_reverse",
+                "anti_diag_forward", "anti_diag_reverse",
             }
             if (not isinstance(self.kda_directions, (list, tuple)) or
                     not self.kda_directions):

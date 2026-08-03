@@ -86,7 +86,7 @@ model:
     #   * encoder_d_model % encoder_heads == 0  (asserted in mha())
     #   * encoder_heads % len(kda_directions) == 0, so the traversal
     #     directions can be split evenly across head groups.
-    # With 8 heads and 4 directions each direction gets 2 heads.
+    # With 8 heads and 8 directions each direction gets 1 head.
     encoder_heads: 8
     # Total q/k/v width of an MHA layer; per-head depth is
     # encoder_d_model / encoder_heads (= 16 here). MHA layers only -- KDA
@@ -121,14 +121,20 @@ model:
     # Board traversal orders for the recurrence. A chess position is not a
     # causal sequence, so heads are split evenly across these and each group
     # scans the 64 squares in its own order. Must be a non-empty list with no
-    # duplicates, drawn from these four names, and encoder_heads must be
-    # divisible by its length. Using all four gives every square context from
-    # both ranks and files in both directions.
+    # duplicates, drawn from these eight names, and encoder_heads must be
+    # divisible by its length. Using all eight gives every square context from
+    # ranks, files, and both diagonals, in both directions -- covering the
+    # move directions of every piece type, including bishops/queens/pawn
+    # captures.
     kda_directions:
         - rank_forward
         - rank_reverse
         - file_forward
         - file_reverse
+        - diag_forward
+        - diag_reverse
+        - anti_diag_forward
+        - anti_diag_reverse
     # Sigmoid gate applied to the mixer output before the final projection.
     # This replaces FLA's gated RMSNorm; leave on unless you are deliberately
     # training an ungated variant.

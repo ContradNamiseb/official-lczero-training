@@ -82,15 +82,19 @@ C. NO allow_neg_eigval.
 CHESS-SPECIFIC ADDITION (beyond FLA)
 ------------------------------------
 
-A chess position is not a causal sequence, so the 64 squares are scanned in four
+A chess position is not a causal sequence, so the 64 squares are scanned in eight
 fixed board traversal orders rather than one:
-    rank_forward, rank_reverse, file_forward, file_reverse
+    rank_forward, rank_reverse, file_forward, file_reverse,
+    diag_forward, diag_reverse, anti_diag_forward, anti_diag_reverse
+The diagonal pair covers the move directions that the 4 orthogonal scans miss
+(bishop, queen, and pawn-capture diagonals), per the Review-Arch-KDA.pdf
+architecture review.
 Heads are split evenly across the enabled directions (encoder_heads must be
 divisible by the number of directions). Each head group is gathered into its own
 traversal order, all groups are concatenated, and a SINGLE recurrence call runs
 over the whole thing -- so the scan executes once, not once per direction. The
 outputs are then scattered back with tf.argsort(order).
-Location: tf/tfprocess.py, KDA_TRAVERSALS (~L88-97) and the KDA mixer (~L1988-2012).
+Location: tf/tfprocess.py, KDA_TRAVERSALS (~L107-136) and the KDA mixer (~L2017-2041).
 
 
 CONFIG SURFACE
@@ -99,7 +103,7 @@ CONFIG SURFACE
   kda_key_dim           : default 32
   kda_value_dim         : default 32
   kda_gate_rank         : default 32
-  kda_directions        : list of the four traversal names
+  kda_directions        : list of the eight traversal names (4 orthogonal, 4 diagonal)
   kda_output_gate       : default true
 
 Validated in TFProcess.__init__: mixer names restricted to {mha, kda};
@@ -162,6 +166,13 @@ materialized:
     int direction = (direction_index == 0) ? d0
                   : (direction_index == 1) ? d1
                   : (direction_index == 2) ? d2 : d3;
+
+NOTE: this engine kernel still only implements the 4 orthogonal directions and
+the KDA_DIRECTION_DIAG_*/KDA_DIRECTION_ANTI_DIAG_* enum values (5-8, added
+alongside the trainer's 8-direction default). A net exported with the 4
+diagonal directions enabled will not run correctly on this engine until the
+SYCL/BLAS kernels are extended to handle them -- see LC0_MINOR_WITH_KDA_8_DIRECTION
+in tf/net.py.
     int square = token;
     if (direction == 2) {
       square = 63 - token;                        // rank reverse
