@@ -127,6 +127,9 @@ message Weights {
     optional float rms_norm_epsilon = 25;
     optional bool output_gate = 26 [default = true];
     optional bool output_rms_norm = 27 [default = true];
+    optional Layer local_conv_w = 28;
+    optional Layer local_conv_b = 29;
+    optional bool local_conv = 30 [default = false];
   }
 
   message EncoderLayer {

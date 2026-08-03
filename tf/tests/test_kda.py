@@ -49,6 +49,7 @@ def make_process():
     process.kda_gate_rank = 4
     process.kda_directions = list(KDA_TRAVERSALS)
     process.kda_output_gate = True
+    process.kda_local_conv = False
     process.model_dtype = tf.float32
     process.use_smolgen = False
     process.use_logit_gating = False
@@ -229,6 +230,97 @@ class KDATest(unittest.TestCase):
         restored = restored_net.get_weights_v2(list(original))
         for name, expected in original.items():
             if expected.ndim == 2 and not (
+                    "/kda/a_log:" in name or "/kda/dt_bias:" in name):
+                expected = expected.T
+            expected = expected.reshape(-1)
+            quantization_step = max(
+                float(np.ptp(expected)) / 0xffff, 1e-6)
+            np.testing.assert_allclose(
+                restored[name], expected, rtol=0,
+                atol=quantization_step,
+                err_msg=name)
+
+    def test_kda_local_conv_shape_and_gradients(self):
+        process = make_process()
+        process.kda_local_conv = True
+        inputs = tf.keras.Input(shape=[64, 16])
+        outputs = process.kda(
+            inputs, emb_size=16, num_heads=4,
+            initializer="glorot_normal", name="encoder_1/kda")
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+        with tf.GradientTape() as tape:
+            output = model(tf.random.normal([2, 64, 16]))
+            loss = tf.reduce_sum(tf.square(output))
+        gradients = tape.gradient(loss, model.trainable_variables)
+
+        self.assertEqual(output.shape, [2, 64, 16])
+        self.assertTrue(np.all(np.isfinite(output.numpy())))
+        self.assertTrue(all(gradient is not None for gradient in gradients))
+        self.assertTrue(all(np.all(np.isfinite(gradient.numpy()))
+                            for gradient in gradients))
+        variable_names = [variable.name
+                          for variable in model.trainable_variables]
+        self.assertTrue(any("/kda/local_conv/depthwise_kernel" in name
+                            for name in variable_names))
+
+    def test_kda_local_conv_only_sees_3x3_neighborhood(self):
+        process = make_process()
+        process.kda_local_conv = True
+        inputs = tf.keras.Input(shape=[64, 16])
+        outputs = process.kda(
+            inputs, emb_size=16, num_heads=4,
+            initializer="glorot_normal", name="encoder_1/kda")
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+        base = tf.random.normal([1, 64, 16])
+        perturbed = base.numpy().copy()
+        # Square (rank=3, file=3) -> token 3*8+3 = 27, outside the 3x3
+        # neighborhood of token 0 (square (rank=0, file=0)).
+        perturbed[0, 27, :] += 5.0
+        output_base = model(base).numpy()
+        output_perturbed = model(tf.constant(perturbed)).numpy()
+
+        np.testing.assert_allclose(
+            output_base[0, 0], output_perturbed[0, 0], rtol=1e-5, atol=1e-5)
+
+    def test_kda_local_conv_protobuf_round_trip(self):
+        process = make_process()
+        process.kda_local_conv = True
+        inputs = tf.keras.Input(shape=[64, 16])
+        outputs = process.kda(
+            inputs, emb_size=16, num_heads=4,
+            initializer="glorot_normal", name="encoder_1/kda")
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+        net = Net()
+        net.set_networkformat(
+            pb.NetworkFormat.NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT)
+        net.set_headcount(4)
+        net.set_kda_directions(list(KDA_TRAVERSALS))
+        net.set_encoder_mixer(
+            0, "kda", key_dim=4, value_dim=4, gate_rank=4,
+            output_gate=True, local_conv=True)
+        original = {weight.name: weight.numpy()
+                    for weight in model.weights}
+        net.fill_net_v2(list(original.items()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(pathlib.Path(directory) / "kda.pb.gz")
+            net.save_proto(filename)
+            restored_net = Net()
+            restored_net.parse_proto(filename)
+
+        encoder = restored_net.pb.weights.encoder[0]
+        self.assertTrue(encoder.kda.local_conv)
+        self.assertGreaterEqual(restored_net.pb.min_version.minor, 34)
+
+        restored = restored_net.get_weights_v2(list(original))
+        for name, expected in original.items():
+            if expected.ndim == 4:
+                # Conv weights: TF [kh, kw, in, out] -> Leela [out, in, kh, kw].
+                expected = np.transpose(expected, axes=[3, 2, 0, 1])
+            elif expected.ndim == 2 and not (
                     "/kda/a_log:" in name or "/kda/dt_bias:" in name):
                 expected = expected.T
             expected = expected.reshape(-1)

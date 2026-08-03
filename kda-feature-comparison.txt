@@ -65,6 +65,12 @@ A. NO SHORT CONVOLUTION.
    q/k/v. Our implementation goes straight from the dense projections (wq/wk/wv)
    into the recurrence. (Conv1D calls do appear in tf/tempCodeRunnerFile.py, but
    that file is a dead scratch copy and is not part of the live model.)
+   Not the same thing, but related: an optional `kda_local_conv` config flag
+   applies a 3x3 DepthwiseConv2D over the 8x8 board (with a residual add) to
+   the *inputs* of a KDA layer, before wq/wk/wv/decay/beta are computed --
+   giving every square same-layer visibility of its immediate (incl. diagonal)
+   neighbors before the linear scan runs. Per Review-Arch-KDA.pdf sections 1-2.
+   Location: tf/tfprocess.py, KDA mixer (`kda_local_conv` branch).
 
 B. NO FusedRMSNormGated OUTPUT NORM.
    FLA normalizes the recurrence output with a gated RMSNorm. Ours uses a plain

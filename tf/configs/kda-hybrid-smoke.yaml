@@ -79,6 +79,7 @@ model:
         - file_forward
         - file_reverse
     kda_output_gate: true
+    kda_local_conv: true
     policy_d_model: 128
     policy_d_aux: 128
     dropout_rate: 0.0
