@@ -16,6 +16,8 @@ dataset:
 training:
     precision: half
     disable_pb_checkpointing: true
+    disable_saved_model_checkpointing: true
+    detailed_summaries: false
     swa: true
     swa_output: true
     swa_max_n: 10

@@ -41,31 +41,48 @@ def fast_get_chunks(d):
     fo_chunknames = []
     subdirs = os.listdir(d)
     chunkfiles_name = "chunknames.pkl"
-    if False and chunkfiles_name in subdirs: # TODO: remove False
-        print(f"Using cached {d + chunkfiles_name}" )
-        with open(d + chunkfiles_name, 'rb') as f:
-            chunknames = pickle.load(f)
-    else:
+    cache_path = d + chunkfiles_name
+    if chunkfiles_name in subdirs:
+        try:
+            with open(cache_path, 'rb') as f:
+                cached = pickle.load(f)
+            # Validate that the cache still covers the current .gz files.
+            current_count = 0
+            for subdir in subdirs:
+                if subdir == chunkfiles_name:
+                    continue
+                if subdir.endswith(".gz"):
+                    current_count += 1
+                else:
+                    prefix = d + subdir + "/"
+                    if os.path.isdir(prefix):
+                        current_count += len([s for s in os.listdir(prefix)
+                                              if s.endswith(".gz")])
+            if len(cached) == current_count:
+                print(f"Using cached {cache_path}")
+                return cached
+            print(f"Stale cache {cache_path}: {len(cached)} vs {current_count} "
+                  f"chunks, rebuilding")
+        except Exception as e:
+            print(f"Failed to load cache {cache_path}: {e}, rebuilding")
 
-        i = 0
-        for subdir in subdirs:
-            if subdir.endswith(".gz"):
-                fo_chunknames.append(d + subdir)
-            else:
-                prefix = d + subdir + "/"
-                if os.path.isdir(prefix):
-                    chunknames.append([prefix + s for s in os.listdir(prefix) if s.endswith(".gz")])
+    for subdir in subdirs:
+        if subdir.endswith(".gz"):
+            fo_chunknames.append(d + subdir)
+        else:
+            prefix = d + subdir + "/"
+            if os.path.isdir(prefix):
+                chunknames.append([prefix + s for s in os.listdir(prefix)
+                                   if s.endswith(".gz")])
 
-            i += 1
-        chunknames.append(fo_chunknames)
-            
-        chunknames = list(itertools.chain.from_iterable(chunknames))
+    chunknames.append(fo_chunknames)
+    chunknames = list(itertools.chain.from_iterable(chunknames))
 
-        with open(d + chunkfiles_name, 'wb') as f:
-            print("Shuffling the chunks", flush=True)
-            random.shuffle(chunknames)
-            print(f"Caching {d + chunkfiles_name}" )
-            pickle.dump(chunknames, f)
+    with open(cache_path, 'wb') as f:
+        print("Shuffling the chunks", flush=True)
+        random.shuffle(chunknames)
+        print(f"Caching {cache_path}")
+        pickle.dump(chunknames, f)
 
     return chunknames
 

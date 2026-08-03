@@ -16,6 +16,8 @@ dataset:
 training:
     precision: single
     disable_pb_checkpointing: false
+    disable_saved_model_checkpointing: true
+    detailed_summaries: false
     swa: true
     swa_output: false
     swa_max_n: 10
@@ -29,12 +31,12 @@ training:
     renorm: true
     renorm_max_r: 1.0
     renorm_max_d: 0.0
-    test_steps: 100
-    num_test_positions: 200
+    test_steps: 500
+    num_test_positions: 512
     train_avg_report_steps: 100
     total_steps: 50000
-    checkpoint_steps: 500
-    shuffle_size: 1_000
+    checkpoint_steps: 5000
+    shuffle_size: 10_000
     warmup_steps: 100
     mask_legal_moves: true
     lr_values:
