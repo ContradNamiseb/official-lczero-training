@@ -15,9 +15,6 @@ LC0_MINOR_WITH_MISH = 29
 LC0_MINOR_WITH_ATTN_BODY = 30
 LC0_MINOR_WITH_MULTIHEAD = 31
 LC0_MINOR_WITH_KDA = 32
-LC0_MINOR_WITH_KDA_NO_RMS_NORM = 33
-LC0_MINOR_WITH_KDA_8_DIRECTION = 34
-LC0_MINOR_WITH_KDA_LOCAL_CONV = 35
 LC0_PATCH = 0
 WEIGHTS_MAGIC = 0x1c0
 
@@ -88,16 +85,11 @@ class Net:
             "anti_diag_reverse":
                 pb.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_REVERSE,
         }
-        diagonal_directions = {
-            "diag_forward", "diag_reverse",
-            "anti_diag_forward", "anti_diag_reverse",
-        }
         del self.pb.format.network_format.kda_directions[:]
         self.pb.format.network_format.kda_directions.extend(
             direction_values[direction] for direction in directions)
-        if (diagonal_directions.intersection(directions) and
-                self.pb.min_version.minor < LC0_MINOR_WITH_KDA_8_DIRECTION):
-            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_8_DIRECTION
+        if self.pb.min_version.minor < LC0_MINOR_WITH_KDA:
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA
 
     def set_encoder_mixer(self, encoder_index, mixer, key_dim=None,
                           value_dim=None, gate_rank=None, output_gate=None,
@@ -118,12 +110,9 @@ class Net:
         encoder.kda.output_gate = output_gate
         # The protobuf default is true, so this must be written explicitly.
         encoder.kda.output_rms_norm = False
-        if self.pb.min_version.minor < LC0_MINOR_WITH_KDA_NO_RMS_NORM:
-            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_NO_RMS_NORM
         encoder.kda.local_conv = local_conv
-        if (local_conv and
-                self.pb.min_version.minor < LC0_MINOR_WITH_KDA_LOCAL_CONV):
-            self.pb.min_version.minor = LC0_MINOR_WITH_KDA_LOCAL_CONV
+        if self.pb.min_version.minor < LC0_MINOR_WITH_KDA:
+            self.pb.min_version.minor = LC0_MINOR_WITH_KDA
 
     def set_policyformat(self, policy):
         self.pb.format.network_format.policy = policy
