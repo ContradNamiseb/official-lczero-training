@@ -172,7 +172,7 @@ Useful flags on both:
 
 | flag | effect |
 |---|---|
-| `--kda-chunk-size 8` | ~2.4x faster than the default 16 on DirectML. Mathematically identical |
+| `--kda-chunk-size 8` | ~2.4x faster than the default 16, and the lowest memory. Mathematically identical — see below |
 | `--grad-accum N` | override `gradient_accumulation_steps` |
 | `--eval-every N` | evaluate on the held-out split. Needs a split config |
 | `--target-step N` | absolute step to stop at, checkpointing along the way |
@@ -252,6 +252,21 @@ other applications before a long run; a browser or editor holding 1-2 GB is
 the difference between fitting and not. Two runs differing only in
 `gradient_accumulation_steps` (8 and 4) failed at 380 s and 423 s, which is
 the same wall in both cases.
+
+`kda.chunk_size` is not a lever either — it is already at its best value.
+Sweeping it on the same machine, trainer only, ~3 minutes per size:
+
+| chunk_size | outcome |
+|---|---|
+| **8** | plateaus at **3.80 GB**, 1069 ms/step, 29.9 pos/sec |
+| 16 | out of memory |
+| 32 | out of memory |
+| 64 | out of memory |
+
+The chunkwise gated delta rule materializes a chunk x chunk score matrix per
+head, so memory grows with the square of the chunk size while the win from
+fewer sequential steps is linear. 8 is both the fastest and the smallest;
+there is no trade to make. 3.80 GB is the floor for this model at batch 32.
 
 **`aten::<op> ... falling back to CPU`** in the log — a real performance cliff,
 not a warning to ignore. One fallback in the training step can dominate the
