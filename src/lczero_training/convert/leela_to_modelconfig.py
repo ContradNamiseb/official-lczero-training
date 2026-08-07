@@ -10,6 +10,22 @@ def _defaultactivation_to_activation(
     }[activation]
 
 
+# Inverse of _KDA_DIRECTION_TO_ENUM in convert/jax_to_leela.py. Kept as an
+# independent mapping (rather than importing that module) to avoid a
+# leela_to_jax.py -> leela_to_modelconfig.py -> jax_to_leela.py import cycle,
+# since leela_to_jax.py already imports from both.
+_KDA_ENUM_TO_DIRECTION = {
+    net_pb2.NetworkFormat.KDA_DIRECTION_RANK_FORWARD: "rank_forward",
+    net_pb2.NetworkFormat.KDA_DIRECTION_RANK_REVERSE: "rank_reverse",
+    net_pb2.NetworkFormat.KDA_DIRECTION_FILE_FORWARD: "file_forward",
+    net_pb2.NetworkFormat.KDA_DIRECTION_FILE_REVERSE: "file_reverse",
+    net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_FORWARD: "diag_forward",
+    net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_REVERSE: "diag_reverse",
+    net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_FORWARD: "anti_diag_forward",
+    net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_REVERSE: "anti_diag_reverse",
+}
+
+
 def leela_to_modelconfig(
     leela_net: net_pb2.Net,
     weights_dtype: hlo_pb2.XlaShapeProto.Type,
@@ -58,9 +74,9 @@ def leela_to_modelconfig(
     def size(x: net_pb2.Weights.Layer) -> int:
         return len(x.params) // 2
 
-    assert (
-        leela_net_format.network
-        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    assert leela_net_format.network in (
+        net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT,
+        net_pb2.NetworkFormat.NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT,
     )
     weights = leela_net.weights
     model_config.embedding.dense_size = size(weights.ip_emb_preproc_b) // 64
@@ -72,24 +88,74 @@ def leela_to_modelconfig(
     model_config.encoder.num_blocks = len(weights.encoder)
     assert model_config.encoder.num_blocks > 0
     encoder = weights.encoder[0]
-    model_config.encoder.d_model = size(encoder.mha.q_b)
     model_config.encoder.heads = weights.headcount
+    # dff/FFN width is shared structure, present on every block regardless
+    # of its mixer, so layer 0 is representative for it even in a mixed
+    # tower.
     model_config.encoder.dff = size(encoder.ffn.dense1_b)
 
+    # Mixer type IS per-block (a real checkpoint can be e.g. [kda, kda,
+    # kda, mha] -- see model/utils.py's encoder_mixer_pattern), so this
+    # has to read every layer, not just layer 0.
+    mixer_types = [layer.mixer for layer in weights.encoder]
+    kda_enum = net_pb2.Weights.EncoderLayer.MIXER_KDA
+    mha_enum = net_pb2.Weights.EncoderLayer.MIXER_MHA
+    if all(m == mixer_types[0] for m in mixer_types):
+        model_config.encoder.mixer_type = (
+            model_config_pb2.MIXER_KDA
+            if mixer_types[0] == kda_enum
+            else model_config_pb2.MIXER_MHA
+        )
+    else:
+        model_config.encoder.mixer_pattern.extend(
+            model_config_pb2.MIXER_KDA
+            if m == kda_enum
+            else model_config_pb2.MIXER_MHA
+            for m in mixer_types
+        )
+
+    kda_layer = next(
+        (layer for layer in weights.encoder if layer.mixer == kda_enum), None
+    )
+    if kda_layer is not None:
+        kda = kda_layer.kda
+        model_config.encoder.kda.key_dim = kda.key_dim
+        model_config.encoder.kda.value_dim = kda.value_dim
+        model_config.encoder.kda.gate_rank = kda.gate_rank
+        model_config.encoder.kda.output_gate = kda.output_gate
+        model_config.encoder.kda.output_rms_norm = kda.output_rms_norm
+        model_config.encoder.kda.local_conv = kda.local_conv
+        # chunk_size has no engine-side field -- it only controls how the
+        # chunkwise-parallel algorithm splits work, not the model's math
+        # (see kda_recurrence's docstring), so there is nothing to recover
+        # here; leave it at the KdaConfig proto default.
+        model_config.encoder.kda.directions.extend(
+            _KDA_ENUM_TO_DIRECTION[d] for d in leela_net_format.kda_directions
+        )
+
+    mha_layer = next(
+        (layer for layer in weights.encoder if layer.mixer == mha_enum), None
+    )
+    if mha_layer is not None:
+        model_config.encoder.d_model = size(mha_layer.mha.q_b)
+
     if weights.HasField("smolgen_w"):
+        assert mha_layer is not None, (
+            "smolgen_w is set but no encoder layer uses MHA"
+        )
         model_config.encoder.smolgen.activation = (
             leela_net_format.smolgen_activation
             or model_config.defaults.activation
         )
         model_config.encoder.smolgen.hidden_channels = (
-            size(encoder.mha.smolgen.compress)
+            size(mha_layer.mha.smolgen.compress)
             // model_config.embedding.embedding_size
         )
         model_config.encoder.smolgen.gen_size = (
-            size(encoder.mha.smolgen.dense2_b) // weights.headcount
+            size(mha_layer.mha.smolgen.dense2_b) // weights.headcount
         )
         model_config.encoder.smolgen.hidden_size = size(
-            encoder.mha.smolgen.dense1_b
+            mha_layer.mha.smolgen.dense1_b
         )
 
     if weights.policy_heads.HasField("ip_pol_w"):
@@ -101,7 +167,11 @@ def leela_to_modelconfig(
         if weights.policy_heads.HasField(head_name):
             head = getattr(weights.policy_heads, head_name)
             assert size(head.ip2_pol_b) > 0
-            assert not head.HasField("ip_pol_w")
+            # Mirrors PolicyHead.__init__'s own invariant: a head has its
+            # own ip_pol_w exactly when the tower has no shared embedding.
+            assert head.HasField("ip_pol_w") != model_config.HasField(
+                "shared_policy_embedding_size"
+            )
             policy_head = model_config.policy_head.add()
             policy_head.name = head_name
             if not model_config.HasField("shared_policy_embedding_size"):

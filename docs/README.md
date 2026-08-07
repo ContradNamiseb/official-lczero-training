@@ -3,6 +3,12 @@
 Note that the code is still in active development, so things change a lot.
 The current document was last updated on 2025-11-30.
 
+> **Training on Windows without CUDA?** This document covers the Linux +
+> JAX/CUDA pipeline. For the native Windows PyTorch/DirectML path — which runs
+> on Intel and AMD integrated graphics with no WSL — see
+> **[directml-windows.md](directml-windows.md)**. The two share the config
+> format, the C++ loader, and the `.pb.gz` network format.
+
 ## Building
 
 The new training pipeline is located in `src/` (Python part) and `csrc/` (C++
@@ -18,8 +24,8 @@ part).
 
 ```bash
 cd <repo-root>
-uv python install 3.12
-uv venv
+uv python install 3.13
+uv venv --python 3.13
 uv sync
 uv pip install meson ruff
 git submodule update --init --recursive
@@ -128,7 +134,7 @@ below).
 | lc0-test-dataloader    |                                                                                                              |
 | lc0-tune-lr            | Trains on exponentially increasing learning rate, and outputs losses into csv file. Useful for picking a LR. |
 | lc0-backfill-metrics   | Loads older checkpoints computes metrics for them, and exports them to tensorboard.                          |
-| lc0-train              | Trains a single epoch (doesn't save or export the model though). Used for benchmarking.                      |
+| lc0-train              | Trains a single epoch, then saves the updated checkpoint.                                                    |
 | lc0-weights            | Manipulates weight files: arithmetic operations, grafting components, format conversion. See [weights_tool.md](weights_tool.md). |
 
 ### C++ tools

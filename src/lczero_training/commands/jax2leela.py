@@ -13,7 +13,26 @@ from lczero_training.convert.jax_to_leela import (
     jax_to_leela,
 )
 from lczero_training.training.state import TrainingState
+from proto import model_config_pb2
 from proto.root_config_pb2 import RootConfig
+
+# Below this, a KDA network's 8-direction scan / no-RMSNorm / local-conv
+# features are not understood by the engine. Mirrors LC0_MINOR_WITH_KDA_*
+# in stable-branch/tf/net.py -- these constants mirror the engine's own
+# versioning and are not ours to invent; upstream lc0 maintainers own
+# version assignment, so this only ever matches the TF reference, never
+# introduces a new minor version.
+_KDA_MIN_VERSION = (0, 33, 0)
+
+
+def _parse_version(version_str: str) -> tuple[int, int, int]:
+    parts = (version_str.lstrip("v").split(".") + ["0", "0"])[:3]
+    major, minor, patch = (int(p) for p in parts)
+    return (major, minor, patch)
+
+
+def _format_version(version: tuple[int, int, int]) -> str:
+    return ".".join(str(p) for p in version)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -92,6 +111,17 @@ def jax2leela(
         export_state = restored_state.jit_state.model_state
         logging.info("Exporting regular model")
 
+    if (
+        config.model.encoder.mixer_type == model_config_pb2.MIXER_KDA
+        and _parse_version(min_version) < _KDA_MIN_VERSION
+    ):
+        logging.warning(
+            "KDA network detected; overriding min-version %s to %s.",
+            min_version,
+            _format_version(_KDA_MIN_VERSION),
+        )
+        min_version = _format_version(_KDA_MIN_VERSION)
+
     options = LeelaExportOptions(
         min_version=min_version,
         num_heads=restored_state.num_heads,
@@ -100,7 +130,11 @@ def jax2leela(
     )
 
     logging.info("Converting to Leela format")
-    net = jax_to_leela(jax_weights=export_state, export_options=options)
+    net = jax_to_leela(
+        jax_weights=export_state,
+        export_options=options,
+        encoder_config=config.model.encoder,
+    )
 
     logging.info("Serializing network")
     network_bytes = gzip.compress(net.SerializeToString())

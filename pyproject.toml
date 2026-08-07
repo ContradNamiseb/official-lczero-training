@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Training scripts and data loading for Leela Chess Zero"
 authors = [{ name = "Leela Chess Zero Team" }]
 readme = "README.md"
-requires-python = ">=3.13"
+# 3.12 rather than 3.13: torch-directml does not publish 3.13 wheels, so the
+# native Windows DirectML environment (the `directml` extra) has to be a 3.12
+# interpreter. Nothing in the base package needs 3.13.
+requires-python = ">=3.12"
+# Accelerator dependencies are deliberately NOT in this list. The default
+# install is CPU-only JAX; see the `cuda` and `directml` extras below.
 dependencies = [
     "pybind11>=2.10.0",
     "numpy>=1.24.0",
@@ -13,7 +18,7 @@ dependencies = [
     "mypy>=1.17.1",
     "pytest>=8.4.1",
     "anyio>=4.10.0",
-    "jax[cuda12]==0.9.1",
+    "jax==0.9.1",
     "flax>=0.11.1",
     "optax>=0.2.5",
     "orbax-checkpoint>=0.11.23",
@@ -22,7 +27,6 @@ dependencies = [
     "matplotlib>=3.10.6",
     "jaxlib==0.9.1",
     "onnxruntime>=1.23.1",
-    "onnxruntime-gpu>=1.23.0",
     "tensorboardx>=2.6.4",
     "graphviz>=0.21",
     "meson>=1.10.1",
@@ -45,8 +49,30 @@ lc0-train = "lczero_training.commands.train:main"
 lc0-daemon = "lczero_training.commands.daemon:main"
 lc0-tui = "lczero_training.commands.tui:main"
 lc0-weights = "lczero_training.commands.weights_tool:main"
+lc0-directml-device = "lczero_training.commands.directml_device:main"
+lc0-directml-bench-kda = "lczero_training.directml.benchmark_kda:main"
+lc0-directml-init = "lczero_training.commands.directml_init:main"
+lc0-directml-train = "lczero_training.commands.directml_train:main"
+lc0-directml-export = "lczero_training.commands.directml_export:main"
+lc0-directml-daemon = "lczero_training.commands.directml_daemon:main"
+lc0-directml-tui = "lczero_training.commands.directml_tui:main"
+lc0-directml-daemon = "lczero_training.commands.directml_daemon:main"
+lc0-directml-tui = "lczero_training.commands.directml_tui:main"
 
 [project.optional-dependencies]
+# CUDA JAX training. Kept out of the default install because the CUDA plugin
+# wheels are several gigabytes.
+cuda = [
+    "jax[cuda12]==0.9.1",
+    "onnxruntime-gpu>=1.23.0",
+]
+# Native Windows DirectML training (docs/directml_training_port.md). Windows
+# only, and never part of a Linux environment -- Linux CI must be able to
+# import lczero_training without PyTorch installed.
+directml = [
+    "torch==2.4.1 ; sys_platform == 'win32'",
+    "torch-directml==0.2.5.dev240914 ; sys_platform == 'win32'",
+]
 dev = [
     "pytest>=7.0.0",
     "mypy>=1.0.0",
@@ -97,6 +123,25 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "tensorboardX"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "torch_directml"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "torch.*"
+ignore_missing_imports = true
+
+# Resolve torch from the CPU wheel index. Plain PyPI `torch` on Windows/Linux
+# drags in several gigabytes of CUDA runtime packages that the DirectML
+# backend never touches.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 
 [tool.pytest.ini_options]

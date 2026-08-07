@@ -5,6 +5,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "utils/platform.h"  // ssize_t under MSVC
+
 #include "absl/algorithm/container.h"
 #include "absl/container/fixed_array.h"
 #include "absl/types/span.h"

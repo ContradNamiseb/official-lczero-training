@@ -1,5 +1,22 @@
 # Training
 
+There are three pipelines in this repository:
+
+| pipeline | location | platform | docs |
+|---|---|---|---|
+| **DirectML / PyTorch** | `src/lczero_training/directml/` | **native Windows**, any DX12 GPU | **[docs/directml-windows.md](docs/directml-windows.md)** |
+| JAX / CUDA ("new") | `src/`, `csrc/` | Linux + NVIDIA | [docs/README.md](docs/README.md) |
+| TensorFlow ("old") | `tf/` | Linux + NVIDIA | this file, below |
+
+This branch's headline addition is the **DirectML pipeline**: the full stack —
+C++ data loader and trainer — running natively on Windows with no WSL, no CUDA
+and no TensorFlow. If you are on Windows with an integrated GPU, start at
+[docs/directml-windows.md](docs/directml-windows.md).
+
+---
+
+## Old TensorFlow pipeline
+
 The training pipeline resides in `tf`, this requires tensorflow running on linux (Ubuntu 16.04 in this case). (It can be made to work on windows too, but it takes more effort.)
 
 ## Installation

@@ -73,6 +73,11 @@ cli_deps = [
   absl_deps['log_initialize'],
   absl_deps['flags'],
   absl_deps['flags_parse'],
+  # loader_lib's headers reach zlib.h through lc0's trainingdata/writer.h.
+  # On Linux that resolves from /usr/include whether or not it is declared;
+  # on Windows zlib only exists inside the subproject, so every target that
+  # includes those headers has to say so.
+  zlib_dep,
 ]
 
 # Protobuf compilation setup
@@ -176,6 +181,7 @@ files = [
   'csrc/loader/stages/stage.cc',
   'csrc/loader/stages/tensor_generator.cc',
   'csrc/utils/gz.cc',
+  'csrc/utils/platform.cc',
   'csrc/utils/stream_shuffler.cc',
   'csrc/utils/training_data_printer.cc',
   'libs/lc0/src/syzygy/syzygy.cc',
@@ -204,7 +210,7 @@ proto_files = [
 
 # Create a dependency for protobuf files that tests can use
 proto_dep = declare_dependency(sources: proto_files)
-test_deps = [gtest_dep, gtest_main_dep, proto_dep]
+test_deps = [gtest_dep, gtest_main_dep, proto_dep, zlib_dep]
 
 
 files += proto_files

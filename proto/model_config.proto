@@ -27,12 +27,56 @@ message EmbeddingConfig {
   optional uint32 dff = 3;
 }
 
+enum MixerType {
+  MIXER_MHA = 0;
+  MIXER_KDA = 1;
+}
+
 message EncoderConfig {
   optional uint32 num_blocks = 3;
   optional uint32 dff = 4;
   optional uint32 d_model = 5;
   optional uint32 heads = 6;
   optional SmolgenConfig smolgen = 9;
+  // Uniform mixer for every block, used only when mixer_pattern is empty.
+  optional MixerType mixer_type = 10 [default = MIXER_MHA];
+  optional KdaConfig kda = 11;
+  // Per-block mixer sequence, tiled (via index % len(mixer_pattern)) to
+  // cover num_blocks -- mirrors the TF reference's encoder_mixer_pattern
+  // (tfprocess.py), which is how e.g. a [kda, kda, kda, mha] tower is
+  // expressed. Takes precedence over mixer_type when non-empty; a config
+  // that only sets mixer_type is equivalent to a one-element pattern.
+  repeated MixerType mixer_pattern = 12;
+}
+
+// Kimi Delta Attention mixer configuration. Only meaningful when
+// EncoderConfig.mixer_type == MIXER_KDA.
+message KdaConfig {
+  // Per-head query/key width. Also the number of gated state dimensions,
+  // since the forget gate is per-dimension. Capped at 32 by the SYCL
+  // inference kernel (private per-work-item state array).
+  optional uint32 key_dim = 1;
+  // Per-head value width.
+  optional uint32 value_dim = 2;
+  // Bottleneck rank of the low-rank pairs producing the decay gate and the
+  // output gate.
+  optional uint32 gate_rank = 3;
+  // Board traversal orders for the recurrence, e.g. "rank_forward",
+  // "diag_reverse". heads must be evenly divisible by len(directions).
+  repeated string directions = 4;
+  // Sigmoid gate applied to the mixer output before the final projection.
+  optional bool output_gate = 5 [default = true];
+  // Legacy RMSNorm before the output gate. The trainer no longer uses this;
+  // kept for compatibility with older checkpoints. Must be written
+  // explicitly on export since the engine's protobuf default is true.
+  optional bool output_rms_norm = 6 [default = false];
+  // Local 3x3 depthwise conv over the 8x8 board before the KDA
+  // projections, so diagonal (bishop/queen/pawn-capture) neighbors are
+  // seen before the linear scan runs.
+  optional bool local_conv = 7 [default = true];
+  // Tokens per chunk of the parallel KDA recurrence. Smaller chunks trade
+  // less sequential depth for more dense work; per-backend tunable.
+  optional uint32 chunk_size = 8 [default = 16];
 }
 
 message SmolgenConfig {

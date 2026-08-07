@@ -16,7 +16,10 @@ namespace training {
 RawFileChunkSource::RawFileChunkSource(
     const std::filesystem::path& filename,
     ChunkSourceLoaderConfig::FrameFormat frame_format)
-    : filename_(filename), frame_format_(frame_format) {}
+    // .string() rather than an implicit conversion: on Windows
+    // path::value_type is wchar_t, so path converts to std::wstring, not
+    // std::string.
+    : filename_(filename.string()), frame_format_(frame_format) {}
 
 RawFileChunkSource::~RawFileChunkSource() = default;
 

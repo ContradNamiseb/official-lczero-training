@@ -46,6 +46,42 @@ class StartTrainingImmediatelyPayload:
 # --- Notifications from Trainer (Child) to UI (Parent) ---
 
 
+class TrainingPhase(Enum):
+    """Where a DirectML training run currently is."""
+
+    STARTING = "STARTING"
+    LOADING_DATA = "LOADING DATA"
+    TRAINING = "TRAINING"
+    SAVING = "SAVING"
+    FINISHED = "FINISHED"
+    FAILED = "FAILED"
+
+
+@register("training_metrics")
+@dataclass
+class TrainingMetricsPayload:
+    """Live per-step training progress.
+
+    Separate from TrainingStatusPayload, which describes the data pipeline
+    and the epoch schedule but carries no loss values at all. Emitted by the
+    DirectML daemon so the TUI can render training itself, not just the
+    loader feeding it.
+    """
+
+    phase: str = TrainingPhase.STARTING.value
+    step: int = 0
+    start_step: int = 0
+    target_step: int = 0
+    # Metric name -> value, exactly as the trainer's reporters see it.
+    losses: Optional[dict] = None
+    grad_norm: Optional[float] = None
+    learning_rate: Optional[float] = None
+    ms_per_step: Optional[float] = None
+    loader_startup_seconds: Optional[float] = None
+    device: Optional[str] = None
+    message: Optional[str] = None
+
+
 @register("training_status")
 @dataclass
 class TrainingStatusPayload:

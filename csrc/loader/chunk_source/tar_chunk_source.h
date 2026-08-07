@@ -8,6 +8,7 @@
 
 #include "loader/chunk_source/chunk_source.h"
 #include "proto/data_loader_config.pb.h"
+#include "utils/platform.h"
 
 namespace lczero {
 namespace training {
@@ -28,14 +29,16 @@ class TarChunkSource : public ChunkSource {
   // Performs one-time indexing during construction. Not part of the interface.
   void Index();
   struct FileEntry {
-    off_t offset;
+    // int64_t, not off_t: MSVC's off_t is a 32-bit long and would silently
+    // truncate offsets in archives past 2 GiB.
+    int64_t offset;
     size_t size;
     bool is_gzip;
   };
 
   void Close();
 
-  int fd_ = -1;
+  PositionedFile file_;
   std::vector<FileEntry> files_;
   std::filesystem::path path_;
   std::string filename_;

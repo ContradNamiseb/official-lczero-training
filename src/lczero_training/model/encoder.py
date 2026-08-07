@@ -8,8 +8,9 @@ from flax.linen import initializers as flax_initializers
 
 from proto import model_config_pb2
 
+from .kda import KdaMixer
 from .shared import Ffn
-from .utils import get_activation
+from .utils import encoder_mixer_pattern, get_activation
 
 
 class EncoderTower(nnx.Module):
@@ -22,9 +23,17 @@ class EncoderTower(nnx.Module):
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
+        mixer_pattern = encoder_mixer_pattern(config)
+
+        # smolgen is only meaningful for MHA blocks, and is itself optional
+        # for those (MultiHeadAttention works fine with smol_gen_dense=
+        # None) -- build the shared dense only when both an MHA block is
+        # actually present in the pattern and the tower opted into
+        # smolgen at all.
         smolgen_shared_gen_dense = None
-        assert config.HasField("smolgen")
-        if config.HasField("smolgen"):
+        if model_config_pb2.MIXER_MHA in mixer_pattern and config.HasField(
+            "smolgen"
+        ):
             smolgen_shared_gen_dense = nnx.Linear(
                 in_features=config.smolgen.gen_size,
                 out_features=64 * 64,
@@ -37,12 +46,21 @@ class EncoderTower(nnx.Module):
                 EncoderBlock(
                     in_features=in_features,
                     config=config,
+                    mixer_type=mixer_pattern[i],
                     defaults=defaults,
-                    smol_gen_dense=smolgen_shared_gen_dense,
+                    # The shared dense is tower-wide, but only the blocks
+                    # that are actually MHA may receive it -- a KDA block
+                    # must never see it, even when some other block in
+                    # the tower is MHA.
+                    smol_gen_dense=(
+                        smolgen_shared_gen_dense
+                        if mixer_pattern[i] == model_config_pb2.MIXER_MHA
+                        else None
+                    ),
                     deepnorm_beta=deepnorm_beta,
                     rngs=rngs,
                 )
-                for _ in range(config.num_blocks)
+                for i in range(config.num_blocks)
             ]
         )
 
@@ -58,20 +76,39 @@ class EncoderBlock(nnx.Module):
         *,
         in_features: int,
         config: model_config_pb2.EncoderConfig,
+        mixer_type: model_config_pb2.MixerType,
         defaults: model_config_pb2.DefaultsConfig,
         smol_gen_dense: Optional[nnx.Linear],
         deepnorm_beta: float,
         rngs: nnx.Rngs,
     ):
-        assert (smol_gen_dense is not None) == config.HasField("smolgen")
-        self.mha = MultiHeadAttention(
-            in_features=in_features,
-            config=config,
-            defaults=defaults,
-            smol_gen_dense=smol_gen_dense,
-            deepnorm_beta=deepnorm_beta,
-            rngs=rngs,
-        )
+        self.is_kda = mixer_type == model_config_pb2.MIXER_KDA
+        # A KDA block never uses the shared smolgen dense, whatever the
+        # tower contains; an MHA block may or may not (smolgen is itself
+        # optional -- see MultiHeadAttention's own HasField check below).
+        assert smol_gen_dense is None or not self.is_kda
+        # Attribute is named `mha` for an MHA block and `mixer` for a KDA
+        # block (never both, never the unused one set to None). The
+        # serializer in convert/leela_pytree_visitor.py dispatches on which
+        # of the two is present in the NNX state tree, and renaming this
+        # uniformly would silently break existing MHA checkpoints.
+        if self.is_kda:
+            self.mixer = KdaMixer(
+                in_features=in_features,
+                config=config.kda,
+                heads=config.heads,
+                deepnorm_beta=deepnorm_beta,
+                rngs=rngs,
+            )
+        else:
+            self.mha = MultiHeadAttention(
+                in_features=in_features,
+                config=config,
+                defaults=defaults,
+                smol_gen_dense=smol_gen_dense,
+                deepnorm_beta=deepnorm_beta,
+                rngs=rngs,
+            )
 
         self.alpha = math.pow(2.0 * config.num_blocks, -0.25)
         self.ln1 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
@@ -85,7 +122,8 @@ class EncoderBlock(nnx.Module):
         self.ln2 = nnx.LayerNorm(in_features, epsilon=1e-3, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = x + self.mha(x) * self.alpha
+        mixer_out = self.mixer(x) if self.is_kda else self.mha(x)
+        x = x + mixer_out * self.alpha
         out1 = self.ln1(x)
         ffn_out = self.ffn(out1)
         return self.ln2(out1 + ffn_out * self.alpha)

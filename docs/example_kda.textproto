@@ -1,0 +1,184 @@
+# Example KDA (Kimi Delta Attention) configuration file for lczero-training.
+#
+# Based on docs/example.textproto -- see that file for a fully-commented
+# walkthrough of the data_loader/training/metrics/export sections, which are
+# unchanged here. This file only differs in `model.encoder`: it uses
+# mixer_type: MIXER_KDA instead of the implicit MHA + smolgen setup.
+#
+# Dimensions below (embedding_size 128, 4 blocks, 8 heads, key/value_dim 32)
+# match the small KDA net already trained in stable-branch
+# (kda-hybrid-128x4-3k1m-8h-small-gen-xpu), so this config is a realistic
+# starting point for round-trip/overfit verification, not just a toy.
+#
+# Note: EncoderConfig.mixer_type is a single field shared by every block in
+# the tower (there is no per-layer mixer pattern in this proto, unlike the
+# TF reference's `encoder_mixer_pattern: [kda, kda, kda, mha]` list) -- every
+# block below is KDA.
+name: "little-teapot"
+data_loader {
+  stage {
+    name: "file_path_provider"
+    file_path_provider {
+      directory: "/home/crem/tmp/2025-07/lczero-training/data2"
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_source_loader"
+    input: "file_path_provider"
+    chunk_source_loader {
+      threads: 1
+      frame_format: V6TrainingData
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "shuffling_chunk_pool"
+    input: "chunk_source_loader"
+    shuffling_chunk_pool {
+      chunk_pool_size: 50000
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_rescorer"
+    input: "shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      syzygy_paths: "/path/to/tb"
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.10
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "chunk_unpacker"
+    input: "chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.03
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "shuffling_frame_sampler"
+    input: "chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 1000000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "tensor_generator"
+    input: "shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 128
+      output {
+        queue_capacity: 8
+      }
+    }
+  }
+  output: "tensor_generator"
+}
+model {
+  defaults {
+    compute_dtype: F32
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+  embedding { dense_size: 64 embedding_size: 128 dff: 192 }
+  encoder {
+    num_blocks: 4
+    dff: 128
+    heads: 8
+    mixer_type: MIXER_KDA
+    kda {
+      key_dim: 32
+      value_dim: 32
+      gate_rank: 32
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+      chunk_size: 16
+    }
+  }
+  policy_head { name: "vanilla" embedding_size: 128 d_model: 128 }
+  value_head { name: "winner" num_channels: 32 }
+  movesleft_head { name: "main" num_channels: 8 }
+}
+training {
+  schedule {
+    steps_per_network: 250
+    chunks_per_network: 50000
+  }
+  lr_schedule {
+    starting_step: 0
+    duration_steps: 0
+    lr: 0.0001
+  }
+  checkpoint {
+    path: "/home/crem/tmp/2025-09/lc0_training/kda_checkpoint"
+    max_to_keep: 5
+  }
+  optimizer {
+    nadamw {
+      beta_1: 0.9  beta_2: 0.98  epsilon: 1e-7  weight_decay: 0.0001
+      decay_selector {
+        rule { match: "**/bias" include: false }
+        rule { match: "**/ln*/**" include: false }
+        rule { match: "**/embedding/embedding/**" include: false }
+        rule { match: "**/policy_heads/**" include: true }
+        rule { match: "**/value_heads/**" include: true }
+        rule { match: "**/movesleft_heads/**" include: true }
+        otherwise_include: false
+      }
+    }
+  }
+  max_grad_norm: 10.0
+  losses {
+    policy {
+      head_name: "vanilla"
+      metric_name: "main_ce"
+      weight: 1.0
+      illegal_moves: MASK
+      type: CROSS_ENTROPY
+    }
+    value { head_name: "winner" weight: 1.0 }
+    movesleft { head_name: "main" weight: 1.0 }
+  }
+}
+metrics {
+  tensorboard_path: "/tmp/tensorboard/kda_run"
+}
+export {
+  destination_filename: "/home/crem/tmp/2025-08/lc0_training/exported_models/kda-{datetime}-{step:08d}.pb.gz"
+  upload_training_run: 3
+}

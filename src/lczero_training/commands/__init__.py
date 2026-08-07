@@ -15,7 +15,7 @@ from .common import (
 )
 
 __all__ = [
-    "configure_root_logging",
     "add_logging_arguments",
+    "configure_root_logging",
     "parse_log_level",
 ]

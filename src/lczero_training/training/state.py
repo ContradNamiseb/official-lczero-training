@@ -140,7 +140,14 @@ class TrainingState:
             step=0,
             model_state=model_state,
             opt_state=opt_state,
-            swa_state=model_state,
+            # None, not model_state: this constructor takes no swa_enabled
+            # flag (unlike training/init.py's real init path, which only
+            # aliases swa_state to model_state when SWA is actually
+            # configured). Aliasing here unconditionally meant every
+            # donate_argnames=("jit_state",) jit call -- e.g. train_step --
+            # flattened the same buffer into two donated positions and
+            # crashed with "Attempt to donate the same buffer twice".
+            swa_state=None,
             num_averages=0.0,
         )
         return TrainingState(

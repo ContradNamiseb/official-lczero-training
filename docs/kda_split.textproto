@@ -1,0 +1,319 @@
+name: "kda-directml-native"
+data_loader {
+  stage {
+    name: "file_path_provider"
+    file_path_provider {
+      directory: "C:/Users/Contrad/Documents/training-data/k2hybrid-bt4tf13g-v7op1"
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_source_loader"
+    input: "file_path_provider"
+    chunk_source_loader {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      frame_format: V7TrainingData
+    }
+  }
+  stage {
+    name: "chunk_source_splitter"
+    input: "chunk_source_loader"
+    chunk_source_splitter {
+      output {
+        name: "train"
+        queue_capacity: 16
+      }
+      output {
+        name: "test"
+        queue_capacity: 16
+      }
+      weight: 95
+      weight: 5
+    }
+  }
+  stage {
+    name: "train_shuffling_chunk_pool"
+    input: "chunk_source_splitter.train"
+    shuffling_chunk_pool {
+      # Sampling WINDOW, not a buffer: the pool draws from the last
+      # chunk_pool_size chunks it has seen, so anything smaller than the
+      # corpus silently trains on a slice of it. 346 tars x 10,000 chunks
+      # = 3,460,000; kept a little above that so newly dropped tars are
+      # covered without another edit. Costs bookkeeping only -- chunk data
+      # is read on demand.
+      chunk_pool_size: 3600000
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_chunk_rescorer"
+    input: "train_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "train_chunk_unpacker"
+    input: "train_chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.5
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_shuffling_frame_sampler"
+    input: "train_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 5000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_tensor_generator"
+    input: "train_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 32
+      output {
+        queue_capacity: 8
+      }
+    }
+  }
+  stage {
+    name: "test_shuffling_chunk_pool"
+    input: "chunk_source_splitter.test"
+    shuffling_chunk_pool {
+      # Same cap as the train pool. The splitter only routes ~5% of the
+      # chunks here, so this is a ceiling the test branch never reaches.
+      chunk_pool_size: 3600000
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_chunk_rescorer"
+    input: "test_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "test_chunk_unpacker"
+    input: "test_chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.5
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_shuffling_frame_sampler"
+    input: "test_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 5000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_tensor_generator"
+    input: "test_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 32
+      output {
+        queue_capacity: 8
+      }
+    }
+  }
+  output: "train:train_tensor_generator"
+  output: "test:test_tensor_generator"
+}
+training {
+  schedule {
+    steps_per_network: 1000
+    chunks_per_network: 500
+  }
+  lr_schedule {
+    duration_steps: 0
+    lr: 0.0001
+  }
+  checkpoint {
+    path: "C:/Users/Contrad/Documents/lc0-directml-checkpoint"
+    max_to_keep: 10
+  }
+  optimizer {
+    nadamw {
+      beta_1: 0.9
+      beta_2: 0.98
+      epsilon: 1e-07
+      weight_decay: 0.0001
+      decay_selector {
+        rule {
+          match: "**/bias"
+        }
+        rule {
+          match: "**/ln*/**"
+        }
+        rule {
+          match: "**/embedding/embedding/**"
+        }
+        rule {
+          match: "**/policy_heads/**"
+          include: true
+        }
+        rule {
+          match: "**/value_heads/**"
+          include: true
+        }
+        rule {
+          match: "**/movesleft_heads/**"
+          include: true
+        }
+      }
+    }
+  }
+  losses {
+    policy {
+      head_name: "vanilla"
+      metric_name: "main_ce"
+      weight: 1.0
+      illegal_moves: MASK
+      type: CROSS_ENTROPY
+    }
+    value {
+      head_name: "winner"
+      weight: 1.0
+    }
+    movesleft {
+      head_name: "main"
+      weight: 1.0
+    }
+  }
+  max_grad_norm: 10.0
+  # Batch 32 is the hard memory ceiling for this model on the Iris Xe (48
+  # already OOMs), so the effective batch is bought with accumulation
+  # instead: 8 x 32 = 256 positions per optimizer step, at the peak memory
+  # of a single 32. Measured cost is nil -- 28.7 pos/sec at 1x versus 32.9
+  # at 8x, since one optimizer step is amortized over eight forwards.
+  gradient_accumulation_steps: 8
+}
+model {
+  defaults {
+    compute_dtype: F32
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+  embedding {
+    dense_size: 64
+    embedding_size: 128
+    dff: 128
+  }
+  encoder {
+    num_blocks: 4
+    dff: 128
+    d_model: 128
+    heads: 8
+    smolgen {
+      hidden_channels: 8
+      hidden_size: 32
+      gen_size: 32
+      activation: ACTIVATION_SWISH
+    }
+    kda {
+      key_dim: 32
+      value_dim: 32
+      gate_rank: 32
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+    }
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_MHA
+  }
+  shared_policy_embedding_size: 128
+  policy_head {
+    name: "vanilla"
+    d_model: 128
+  }
+  policy_head {
+    name: "optimistic_st"
+    d_model: 128
+  }
+  value_head {
+    name: "winner"
+    num_channels: 64
+  }
+  value_head {
+    name: "q"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  value_head {
+    name: "st"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  movesleft_head {
+    name: "main"
+    num_channels: 32
+  }
+}
+metrics {
+  tensorboard_path: "C:/Users/Contrad/Documents/lc0-directml-tensorboard"
+}
+export {
+  destination_filename: "C:/Users/Contrad/Documents/lc0-directml-networks/kda-native-{step}.pb.gz"
+}

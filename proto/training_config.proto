@@ -14,6 +14,12 @@ message TrainingConfig {
   // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
   // disabled.
   SWAConfig swa = 7;
+  // Micro-batches accumulated into one optimizer step. The effective batch
+  // is this times the tensor_generator's batch_size, at the peak memory of
+  // a single micro-batch -- the way to train on a large batch when a large
+  // batch does not fit on the device. 0 or 1 means no accumulation.
+  // Equivalent to num_batch_splits in the TF pipeline.
+  uint32 gradient_accumulation_steps = 8;
 }
 
 message ScheduleConfig {

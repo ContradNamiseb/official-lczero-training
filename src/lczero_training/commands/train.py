@@ -90,6 +90,15 @@ def train(config_filename: str) -> None:
         config.training.schedule.steps_per_network,
     )
 
+    training_state = training_state.replace(jit_state=new_state)
+    logging.info("Saving checkpoint at step %s", new_state.step)
+    checkpoint_mgr.save(
+        step=new_state.step,
+        args=ocp.args.PyTreeSave(item=training_state),
+    )
+    checkpoint_mgr.wait_until_finished()
+    logging.info("Checkpoint saved")
+
     if config.export.destination_filename:
         date_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -107,7 +116,11 @@ def train(config_filename: str) -> None:
             else new_state.model_state
         )
         assert isinstance(export_state, nnx.State)
-        net = jax_to_leela(jax_weights=export_state, export_options=options)
+        net = jax_to_leela(
+            jax_weights=export_state,
+            export_options=options,
+            encoder_config=config.model.encoder,
+        )
         network_bytes = gzip.compress(net.SerializeToString())
 
         for destination_template in config.export.destination_filename:

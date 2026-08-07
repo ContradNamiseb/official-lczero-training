@@ -1,0 +1,74 @@
+/* Dense widget-dashboard layout. One border per panel, no outer frame --
+   an outer full-screen border would be a second nesting level that buys
+   nothing. Titles live in the border, which is free vertical space. */
+
+Screen {
+    layout: vertical;
+    background: $surface;
+}
+
+/* Panels size to their content; the log takes whatever is left, so the
+   dashboard never grows a dead region when the terminal is tall. */
+#header {
+    height: 3;
+    border: round $primary;
+    border-title-color: $accent;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
+#row-top {
+    height: 8;
+}
+
+#row-mid {
+    height: 8;
+}
+
+#row-top > Static,
+#row-mid > Static {
+    width: 1fr;
+    border: round $panel-lighten-2;
+    border-title-color: $text-muted;
+    padding: 0 1;
+}
+
+StreamingLogPane {
+    height: 1fr;
+    min-height: 4;
+    border: round $panel-lighten-2;
+    border-title-color: $text-muted;
+    padding: 0 1;
+}
+
+Footer {
+    height: 1;
+}
+
+/* Narrow (<90 cols): the two-up rows stack. Costs height, keeps every
+   value readable rather than truncating labels. */
+Screen.narrow #row-top,
+Screen.narrow #row-mid {
+    layout: vertical;
+    height: auto;
+}
+
+Screen.narrow #row-top > Static,
+Screen.narrow #row-mid > Static {
+    width: 100%;
+    height: 7;
+}
+
+/* Short (<30 rows): drop the policy/optimizer row. Losses and KDA health
+   are what you watch continuously; the rest is available in TensorBoard.
+   Without this, 80x24 pushes the log and footer off the bottom. */
+Screen.short #row-mid {
+    display: none;
+}
+
+/* Below the floor, say so rather than render a broken grid. */
+Screen.too-small #row-top,
+Screen.too-small #row-mid,
+Screen.too-small StreamingLogPane {
+    display: none;
+}

@@ -109,6 +109,41 @@ class LeelaToJax(LeelaPytreeWeightsVisitor):
         values = values.reshape(param.shape[::-1]).transpose()
         param.value = values
 
+    def kda_local_conv(
+        self,
+        nnx_dict: nnx.State,
+        kernel_weights: net_pb2.Weights.Layer,
+        bias_weights: net_pb2.Weights.Layer,
+    ) -> None:
+        # Inverse of JaxToLeela.kda_local_conv (jax_to_leela.py): that
+        # direction proved leela_flat[c*9 + kr*3 + kf] == kernel[kr, kf,
+        # 0, c] for the (kh, kw, 1, channels) Flax depthwise kernel, i.e.
+        # flattening (channels, 1, kr, kf) in C order. Undo that by
+        # dequantizing (same as tensor()'s generic path, which can't be
+        # reused directly because the *shape* this reshapes into isn't
+        # simply param.shape[::-1]), reshaping back to (channels, 1, kr,
+        # kf), then transposing to Flax's (kr, kf, 1, channels).
+        kernel_param = cast(nnx.Param, nnx_dict["kernel"])
+        channels = kernel_param.value.shape[-1]
+        assert len(kernel_weights.params) // 2 == channels * 9, (
+            f"expected a channels*9 flat depthwise kernel for "
+            f"channels={channels}, got "
+            f"{len(kernel_weights.params) // 2} values"
+        )
+        values = jnp.frombuffer(kernel_weights.params, dtype=jnp.uint16)
+        values = values.astype(jnp.float32)
+        alpha = values / 65535.0
+        values = (
+            alpha * kernel_weights.max_val
+            + (1.0 - alpha) * kernel_weights.min_val
+        )
+        values = values.astype(kernel_param.dtype)
+        channel_major = values.reshape((channels, 1, 3, 3))
+        kernel_param.value = jnp.transpose(channel_major, (2, 3, 1, 0))
+
+        if "bias" in nnx_dict:
+            self.tensor(cast(nnx.Param, nnx_dict["bias"]), bias_weights)
+
 
 def leela_to_jax(
     leela_net: net_pb2.Net, import_options: LeelaImportOptions
@@ -168,8 +203,12 @@ def leela_to_jax_files(
     state = leela_to_jax(lc0_weights, import_options)
 
     if output_serialized_jax:
+        # flax.serialization.to_bytes/msgpack only understands plain
+        # pytrees of arrays, not nnx.State's nnx.Variable-wrapped leaves
+        # (this predates the KDA work -- any leela2jax run with this flag
+        # hit it). to_pure_dict() strips the wrappers.
         with open(output_serialized_jax, "wb") as f:
-            f.write(serialization.to_bytes(state))
+            f.write(serialization.to_bytes(state.to_pure_dict()))
 
     if output_leela_verification:
         min_version = (
@@ -186,6 +225,10 @@ def leela_to_jax_files(
             license=license_str,
             training_steps=lc0_weights.training_params.training_steps,
         )
-        verification_net = jax_to_leela(state, export_options)
+        verification_net = jax_to_leela(
+            jax_weights=state,
+            export_options=export_options,
+            encoder_config=config.encoder,
+        )
         with gzip.open(output_leela_verification, "wb") as f:
             f.write(verification_net.SerializeToString())

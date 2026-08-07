@@ -4,8 +4,24 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.nn import mish
 
-from proto import net_pb2
+from proto import model_config_pb2, net_pb2
 from proto.hlo_pb2 import XlaShapeProto
+
+
+def encoder_mixer_pattern(
+    config: model_config_pb2.EncoderConfig,
+) -> list[model_config_pb2.MixerType]:
+    """Per-block mixer type for each of config.num_blocks encoder blocks.
+
+    Mirrors the TF reference's encoder_mixer_pattern tiling
+    (stable-branch/tf/tfprocess.py, ~L379-409): mixer_pattern is repeated
+    (via index % len(pattern)) to cover num_blocks, so e.g. a 1-element
+    pattern (or the unset case, which falls back to mixer_type) still
+    means "every block", and a genuinely mixed tower like [kda, kda, kda,
+    mha] is expressed exactly, not approximated by a single mixer_type.
+    """
+    pattern = list(config.mixer_pattern) or [config.mixer_type]
+    return [pattern[i % len(pattern)] for i in range(config.num_blocks)]
 
 
 def get_activation(

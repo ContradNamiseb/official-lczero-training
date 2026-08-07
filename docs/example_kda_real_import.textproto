@@ -1,0 +1,206 @@
+# Working config for importing the real kda-hybrid-128x4-3k1m-8h-small-gen-xpu
+# checkpoint (step 97000) and continuing training on it in the new pipeline.
+#
+# `model` below is the *exact* config lc0-leela2jax extracts from that net
+# (--print-model-config) -- it must match exactly, or lc0-init will refuse to
+# load the weights unless you pass --ignore-config-mismatch. This is a real
+# hybrid tower: 3 KDA blocks + 1 MHA block (mixer_pattern), not pure KDA.
+#
+# Usage (adjust file_path_provider.directory, --lczero_model, and
+# checkpoint.path for your own paths first):
+#
+#   uv run lc0-init --config docs/example_kda_real_import.textproto \
+#       --lczero_model /path/to/kda-hybrid-...-97000.pb.gz
+#   uv run lc0-train --config docs/example_kda_real_import.textproto
+#
+# lc0-init seeds an orbax checkpoint at training.checkpoint.path from the
+# imported weights (step 97000); lc0-train then runs
+# training.schedule.steps_per_network steps (100 here) starting from there,
+# logging loss every step. Re-running lc0-train continues from the latest
+# checkpoint in that directory.
+name: "kda-real-import-test"
+data_loader {
+  stage {
+    name: "file_path_provider"
+    file_path_provider {
+      directory: "/home/contrad/training-data/training-k2hyb-20260720-0009"
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_source_loader"
+    input: "file_path_provider"
+    chunk_source_loader {
+      threads: 1
+      frame_format: V7TrainingData
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "shuffling_chunk_pool"
+    input: "chunk_source_loader"
+    shuffling_chunk_pool {
+      chunk_pool_size: 500
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_rescorer"
+    input: "shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.10
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "chunk_unpacker"
+    input: "chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.5
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "shuffling_frame_sampler"
+    input: "chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 20000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "tensor_generator"
+    input: "shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 32
+      output {
+        queue_capacity: 8
+      }
+    }
+  }
+  output: "tensor_generator"
+}
+model {
+  defaults {
+    compute_dtype: F32
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+  embedding { dense_size: 64 embedding_size: 128 dff: 128 }
+  encoder {
+    num_blocks: 4
+    dff: 128
+    d_model: 128
+    heads: 8
+    smolgen {
+      hidden_channels: 8
+      hidden_size: 32
+      gen_size: 32
+      activation: ACTIVATION_SWISH
+    }
+    kda {
+      key_dim: 32
+      value_dim: 32
+      gate_rank: 32
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+    }
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_MHA
+  }
+  shared_policy_embedding_size: 128
+  policy_head { name: "vanilla" d_model: 128 }
+  policy_head { name: "optimistic_st" d_model: 128 }
+  value_head { name: "winner" num_channels: 64 }
+  value_head {
+    name: "q"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  value_head {
+    name: "st"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  movesleft_head { name: "main" num_channels: 32 }
+}
+training {
+  schedule {
+    steps_per_network: 100
+    chunks_per_network: 500
+  }
+  lr_schedule {
+    starting_step: 0
+    duration_steps: 0
+    lr: 0.0001
+  }
+  checkpoint {
+    path: "/tmp/kda_real_train_checkpoint"
+    max_to_keep: 2
+  }
+  optimizer {
+    nadamw {
+      beta_1: 0.9  beta_2: 0.98  epsilon: 1e-7  weight_decay: 0.0001
+      decay_selector {
+        rule { match: "**/bias" include: false }
+        rule { match: "**/ln*/**" include: false }
+        rule { match: "**/embedding/embedding/**" include: false }
+        rule { match: "**/policy_heads/**" include: true }
+        rule { match: "**/value_heads/**" include: true }
+        rule { match: "**/movesleft_heads/**" include: true }
+        otherwise_include: false
+      }
+    }
+  }
+  max_grad_norm: 10.0
+  losses {
+    policy {
+      head_name: "vanilla"
+      metric_name: "main_ce"
+      weight: 1.0
+      illegal_moves: MASK
+      type: CROSS_ENTROPY
+    }
+    value { head_name: "winner" weight: 1.0 }
+    movesleft { head_name: "main" weight: 1.0 }
+  }
+}
+metrics {
+  tensorboard_path: "/tmp/tensorboard/kda_real_train"
+}

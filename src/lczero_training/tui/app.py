@@ -21,9 +21,11 @@ from ..daemon.protocol.communicator import AsyncCommunicator
 from ..daemon.protocol.messages import (
     StartTrainingImmediatelyPayload,
     StartTrainingPayload,
+    TrainingMetricsPayload,
     TrainingStatusPayload,
 )
 from .data_pipeline_pane import DataPipelinePane
+from .directml_training_pane import DirectMlTrainingPane
 from .log_pane import StreamingLogPane
 from .training_widgets import TrainingScheduleWidget
 
@@ -79,6 +81,15 @@ class TrainingTuiApp(App):
             help="Path to file for dumping raw daemon IO for debugging",
         )
         parser.add_argument(
+            "--daemon-module",
+            default="lczero_training.commands.daemon",
+            help=(
+                "Daemon module to run. Use "
+                "lczero_training.commands.directml_daemon for native Windows "
+                "DirectML training."
+            ),
+        )
+        parser.add_argument(
             "--daemon-flag",
             action="append",
             default=[],
@@ -118,6 +129,9 @@ class TrainingTuiApp(App):
         self._logfile: Optional[str] = args.logfile
         self._io_dump_file: Optional[str] = args.io_dump
         self._daemon_flags: list[str] = args.daemon_flags
+        self._daemon_module: str = getattr(
+            args, "daemon_module", "lczero_training.commands.daemon"
+        )
 
     async def on_load(self) -> None:
         """Start the daemon process and communicator when the app loads."""
@@ -130,7 +144,7 @@ class TrainingTuiApp(App):
             [
                 sys.executable,
                 "-m",
-                "lczero_training.commands.daemon",
+                self._daemon_module,
                 *self._daemon_flags,
             ],
             stdin=subprocess.PIPE,
@@ -171,9 +185,16 @@ class TrainingTuiApp(App):
             self._training_schedule_widget.border_title = "Training Schedule"
             yield self._training_schedule_widget
 
-            jax_training_pane = JAXTrainingPane()
-            jax_training_pane.border_title = "JAX Training Status"
-            yield jax_training_pane
+            # The DirectML daemon reports real per-step metrics; the JAX one
+            # has no equivalent message, so it still gets the placeholder.
+            if self._daemon_module.endswith("directml_daemon"):
+                self._training_pane = DirectMlTrainingPane()
+                self._training_pane.border_title = "DirectML Training"
+                yield self._training_pane
+            else:
+                jax_training_pane = JAXTrainingPane()
+                jax_training_pane.border_title = "JAX Training Status"
+                yield jax_training_pane
 
         yield StreamingLogPane(
             stream=self._log_stream, logfile_path=self._logfile
@@ -242,3 +263,11 @@ class TrainingTuiApp(App):
         self._training_schedule_widget.update_training_schedule(
             payload.training_schedule
         )
+
+    async def on_training_metrics(
+        self, payload: TrainingMetricsPayload
+    ) -> None:
+        """Handle live per-step metrics from the DirectML daemon."""
+        pane = getattr(self, "_training_pane", None)
+        if pane is not None:
+            pane.update_metrics(payload)

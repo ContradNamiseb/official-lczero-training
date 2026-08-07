@@ -1,3 +1,4 @@
 [submodule "libs/lc0"]
 	path = libs/lc0
-	url = https://github.com/LeelaChessZero/lc0.git
+	url = https://github.com/ContradNamiseb/lc0.git
+	branch = feature/kda-net-support
