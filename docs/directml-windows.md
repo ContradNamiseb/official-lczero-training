@@ -221,10 +221,28 @@ Windows cannot stat it and collection fails with `OSError: [WinError 1920]`.
 
 ## Troubleshooting
 
-**`Not enough memory resources are available`** — the batch does not fit.
-Lower `tensor_generator.batch_size` and raise `gradient_accumulation_steps` to
-compensate; the effective batch is the product of the two. Also lower
-`shuffling_frame_sampler.reservoir_size_per_thread`, which is host memory.
+**`Not enough memory resources are available`** — a host allocation failed.
+Two distinct causes, and they need different fixes.
+
+*If it fails immediately*, the batch does not fit. Lower
+`tensor_generator.batch_size` and raise `gradient_accumulation_steps` to
+compensate; the effective batch is the product of the two.
+
+*If it fails minutes into a run that started fine*, memory is growing while
+training. **There is an open leak on the data loader side.** Measured on a
+128x4 model, batch 32, 346 tars, `chunk_pool_size: 3600000`:
+
+| configuration | committed memory |
+|---|---|
+| trainer alone, synthetic batches, 400 steps | plateaus at 3.80 GB (+0.13 MB/s) |
+| trainer + data loader | 3.1 → 5.5 GB in 72 s (**+32 MB/s**) |
+
+The trainer is flat; the loader is not. Two runs that differed only in
+`gradient_accumulation_steps` (8 and 4) died 380 s and 423 s in — halving the
+accumulation bought 11% more runway, which is what you expect if accumulation
+is not the driver. Until this is fixed, a long run needs headroom: the trainer
+alone needs ~3.8 GB, so on a 12 GB machine close other applications before
+starting.
 
 **`aten::<op> ... falling back to CPU`** in the log — a real performance cliff,
 not a warning to ignore. One fallback in the training step can dominate the
