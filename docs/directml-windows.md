@@ -228,21 +228,30 @@ Two distinct causes, and they need different fixes.
 `tensor_generator.batch_size` and raise `gradient_accumulation_steps` to
 compensate; the effective batch is the product of the two.
 
-*If it fails minutes into a run that started fine*, memory is growing while
-training. **There is an open leak on the data loader side.** Measured on a
+*If it fails minutes into a run that started fine*, the working set does not
+fit in physical memory. This is a capacity problem, not a leak — measured on a
 128x4 model, batch 32, 346 tars, `chunk_pool_size: 3600000`:
 
 | configuration | committed memory |
 |---|---|
-| trainer alone, synthetic batches, 400 steps | plateaus at 3.80 GB (+0.13 MB/s) |
-| trainer + data loader | 3.1 → 5.5 GB in 72 s (**+32 MB/s**) |
+| trainer alone, synthetic batches | ramps for ~100 s, then plateaus at **3.80 GB** (+0.13 MB/s) |
+| trainer + data loader | ramps for ~100 s, then plateaus at **5.46 GB** (+0.14 MB/s) |
 
-The trainer is flat; the loader is not. Two runs that differed only in
-`gradient_accumulation_steps` (8 and 4) died 380 s and 423 s in — halving the
-accumulation bought 11% more runway, which is what you expect if accumulation
-is not the driver. Until this is fixed, a long run needs headroom: the trainer
-alone needs ~3.8 GB, so on a 12 GB machine close other applications before
-starting.
+Both plateau, at the same negligible rate. The loader accounts for the ~1.6 GB
+difference; the trainer's own 3.8 GB is the dominant term.
+
+The failure mode is what happens when 5.5 GB of working set meets ~4 GB of
+free memory. Windows trims the resident set — RSS fell 4734 → 2502 MB across
+one run while committed memory stayed flat — and once free physical memory
+reaches a few hundred MB, a DirectML allocation fails, because GPU-shared
+memory has to be resident and cannot be paged out. Free physical hit 238 MB
+shortly before the failures here.
+
+So the lever is free RAM, not run length or the accumulation setting. Close
+other applications before a long run; a browser or editor holding 1-2 GB is
+the difference between fitting and not. Two runs differing only in
+`gradient_accumulation_steps` (8 and 4) failed at 380 s and 423 s, which is
+the same wall in both cases.
 
 **`aten::<op> ... falling back to CPU`** in the log — a real performance cliff,
 not a warning to ignore. One fallback in the training step can dominate the
