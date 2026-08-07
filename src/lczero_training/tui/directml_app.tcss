@@ -56,7 +56,17 @@ Screen.narrow #row-mid {
 Screen.narrow #row-top > Static,
 Screen.narrow #row-mid > Static {
     width: 100%;
-    height: 7;
+    /* 6, not 7: border takes 2, leaving exactly the 4 content rows both
+       panels need (kda is a header plus three blocks). Stacked panels are
+       paid for twice over, so the extra row is the difference between
+       fitting on a 16-row terminal and pushing kda off the bottom. */
+    height: 6;
+}
+
+/* No room for the log once the panels have stacked. Losing scrollback is
+   better than losing a panel: the log is also on disk via --logfile. */
+Screen.no-log StreamingLogPane {
+    display: none;
 }
 
 /* Short (<30 rows): drop the policy/optimizer row. Losses and KDA health
@@ -71,4 +81,16 @@ Screen.too-small #row-top,
 Screen.too-small #row-mid,
 Screen.too-small StreamingLogPane {
     display: none;
+}
+
+/* The notice is the inverse: present only below the floor. */
+#too-small-notice {
+    display: none;
+}
+
+Screen.too-small #too-small-notice {
+    display: block;
+    height: 1fr;
+    content-align: center middle;
+    color: $warning;
 }

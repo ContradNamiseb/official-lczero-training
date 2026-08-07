@@ -106,6 +106,54 @@ class DirectMlTrainingDaemon:
         for template in destinations:
             write_leela_file(template.format(datetime=stamp, step=step), net)
 
+    @staticmethod
+    def _emergency_save(
+        config, model, optimizer, step, directory, error
+    ) -> None:
+        """Checkpoint after a failed step, on a device that just ran out.
+
+        Static because it touches no daemon state: a test can call it
+        without constructing a daemon, and constructing one starts a
+        thread that reads sys.stdin, which does not belong in a unit test.
+
+        This exists for out-of-memory failures, and naively it does not
+        survive one: a checkpoint copies every parameter and both optimizer
+        moments to the host, which needs memory, and the exception being
+        handled still holds the whole failed step alive. Python keeps a
+        traceback on the exception, every frame in it keeps its locals, and
+        those locals are the activations that could not be allocated around.
+        Clearing the frames first is what makes the save possible.
+        """
+        import gc
+        import traceback
+
+        # Imported here, not taken from run(): run()'s imports are local to
+        # that function, so referencing them from this method would raise
+        # NameError at precisely the moment the checkpoint matters.
+        from lczero_training.directml import checkpoint as checkpoint_io
+        from lczero_training.directml.training import make_checkpoint
+
+        if error.__traceback__ is not None:
+            traceback.clear_frames(error.__traceback__)
+        gc.collect()
+
+        try:
+            checkpoint_io.save(
+                directory,
+                make_checkpoint(config, model, optimizer, step),
+                max_to_keep=config.training.checkpoint.max_to_keep,
+            )
+            logger.info("Saved recovery checkpoint at step %d", step)
+        except Exception:  # noqa: BLE001
+            # Never mask the original failure with this one, but never fail
+            # silently either -- the whole point is that the user knows
+            # whether the steps since the last checkpoint survived.
+            logger.exception(
+                "Could not save a recovery checkpoint at step %d; "
+                "progress since the last checkpoint is lost",
+                step,
+            )
+
     def _make_eval_hook(
         self, config, model, device, loader, has_split: bool, device_name: str
     ):
@@ -338,10 +386,8 @@ class DirectMlTrainingDaemon:
             logger.error("Training stopped at step %d: %s", final_step, error)
             # Save whatever completed rather than losing the segment.
             if final_step > start_step:
-                checkpoint_io.save(
-                    directory,
-                    make_checkpoint(config, model, optimizer, final_step),
-                    max_to_keep=config.training.checkpoint.max_to_keep,
+                self._emergency_save(
+                    config, model, optimizer, final_step, directory, error
                 )
         finally:
             try:

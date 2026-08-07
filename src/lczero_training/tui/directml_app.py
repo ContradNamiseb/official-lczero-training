@@ -370,9 +370,18 @@ class DirectMlTuiApp(App):
         )
         log.border_title = "loader"
         yield log
+
+        # Shown only below the size floor, where every panel above is
+        # hidden. Without it the screen is a header, a void, and a footer,
+        # which reads as a broken dashboard rather than a small window.
+        yield Static(
+            "terminal too small — needs at least 70x14",
+            id="too-small-notice",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
+        self._apply_breakpoints(self.size.width, self.size.height)
         self.run_worker(self._communicator.run(), exclusive=True)
         self.run_worker(self._send_start(), exclusive=False)
         self.run_worker(self._watch_daemon(), exclusive=False)
@@ -392,13 +401,30 @@ class DirectMlTuiApp(App):
         )
 
     def on_resize(self, event) -> None:
+        self._apply_breakpoints(event.size.width, event.size.height)
+
+    def _apply_breakpoints(self, width: int, height: int) -> None:
         # Breakpoint ladder. Width decides whether the two-up rows stack;
         # height decides whether the second row survives at all. Stacking
         # costs rows, so a short-and-narrow terminal needs both.
-        width, height = event.size.width, event.size.height
-        self.set_class(width < 90, "narrow")
-        self.set_class(height < 30, "short")
-        self.set_class(width < 70 or height < 14, "too-small")
+        #
+        # Called from on_mount as well as on_resize: Textual delivers Resize
+        # only when the terminal actually changes, so a window that is
+        # already small when the app starts would otherwise never get any
+        # of these classes and would lay itself out as if it were wide.
+        # On the screen, not on self: App.set_class puts the class on the
+        # App node, and every breakpoint rule in the stylesheet is written
+        # `Screen.narrow`, `Screen.short`, ... Setting them on the App means
+        # the selectors never match and the whole ladder silently does
+        # nothing, which is exactly what it did until this was found.
+        screen = self.screen
+        screen.set_class(width < 90, "narrow")
+        screen.set_class(height < 30, "short")
+        # Stacking doubles the height the top row needs, so the point at
+        # which the log pane stops fitting depends on width, not just
+        # height. Budget: header 3 + rows + log 4 + footer 1.
+        screen.set_class(height < (20 if width < 90 else 16), "no-log")
+        screen.set_class(width < 70 or height < 14, "too-small")
 
     async def on_training_metrics(
         self, payload: TrainingMetricsPayload
