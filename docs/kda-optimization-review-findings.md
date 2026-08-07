@@ -253,11 +253,59 @@ Everything above is measured. These are not:
 
 ---
 
+## 7a. Cross-implementation parity, after a second opinion
+
+A second review raised a fair point: the factored form means this port now
+computes the decay path by a *different algorithm* than the JAX reference
+and the SYCL engine, which both use the row-by-row pairwise form
+(confirmed in `model/kda.py`), rather than merely rounding differently.
+
+Two corrections to how that was put, and one measurement.
+
+**It is conditional on chunk size.** Above the safety threshold the port
+takes the fallback, which is structurally the same loop as JAX's. So the
+factorization differs only at `chunk_size ≤ 8` — which is what production
+runs, so the point stands, but it is not unconditional.
+
+**They were never bit-comparable.** `test_recurrence_matches_jax` has
+always asserted `rtol=1e-4`, not equality: different framework, batched
+versus unbatched, different reduction orders. The change widens the *class*
+of difference — algorithmic rather than just associative — inside a
+tolerance that was always tolerance.
+
+**There is no accuracy penalty, which is not obvious.** The natural worry
+is that `exp(cum[i]) * exp(-cum[j])`, built from two extreme numbers, loses
+precision against `exp(cum[i] - cum[j])` built from a small difference.
+Measured against a float64 sequential reference at chunk_size 8:
+
+| gate saturated | factored | pairwise | ratio |
+|---|---|---|---|
+| 0% | 6.35e−08 | 5.25e−08 | 1.2x |
+| 25% | 1.15e−07 | 1.01e−07 | 1.1x |
+| 50% | 1.17e−07 | 1.10e−07 | 1.1x |
+| 100% | 4.46e−08 | 4.03e−08 | 1.1x |
+
+The two paths also agree with each other to 6.0e−08.
+
+The reason is that catastrophic cancellation is a property of *subtraction*,
+and this is a *product*: floating-point multiplication carries a relative
+error of about one ulp whatever the exponents, so `exp(a) * exp(-b)` is as
+accurate as `exp(a - b)` right up until a factor leaves representable
+range. **Range was the entire failure mode**, which is why the chunk-size
+guard is a complete fix rather than a partial one, and why there is no
+accuracy argument for preferring the slow path where the fast one is safe.
+
+Reproduce with `scratchpad/path_accuracy.py`, which forces each path by
+patching `_factored_decay_is_safe` and compares both to float64.
+
+---
+
 ## 8. What I did not verify
 
 - **Whether the reassociation changes training dynamics.** Parity holds to
-  `rtol=1e-4` per call, but I have not run a long training comparison. The
-  rounding differs; over 100k steps that could diverge.
+  `rtol=1e-4` per call and the factored form carries no measurable accuracy
+  penalty (§7a), but I have not run a long training comparison. Per-call
+  agreement is not the same as 100k-step agreement.
 - **fp16.** Flagged as a next lever. Note it is worse than a precision
   question: fp16's maximum is 65504 = `exp(11)`, and this code needs
   `exp(80)` at chunk_size 8. Any fp16 cast on the decay path overflows on

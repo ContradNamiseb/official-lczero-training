@@ -143,3 +143,25 @@ exposes a fixed operator set and tensors are opaque. Do not change the 8
 traversal tables or the −10 decay floor; both are frozen byte-for-byte across
 three implementations (JAX reference, this port, and the SYCL engine), and
 the test suite asserts they stay identical.
+
+## Cross-implementation parity on the decay path
+
+At `chunk_size ≤ 8` this port now computes the intra-chunk decay by a
+different algorithm than the JAX reference and the SYCL engine, which both
+use the row-by-row pairwise form. Above that threshold it falls back to
+that same form, so the difference is specific to the fast path.
+
+This was never bit-exact parity — `test_recurrence_matches_jax` has always
+asserted `rtol=1e-4`, since the implementations differ in framework,
+batching and reduction order. What changed is the *kind* of difference:
+algorithmic rather than associative. Do not expect byte-identical decay
+intermediates across the three when debugging.
+
+There is no accuracy cost. Measured against a float64 sequential reference
+at chunk_size 8 across 0-100% gate saturation, the factored path is within
+1.0-1.2x of the pairwise path's error (both around 1e-7), and the two agree
+with each other to 6e-8. Multiplication carries about one ulp of relative
+error whatever the exponents — cancellation is a property of subtraction —
+so the factored form is as accurate as the pairwise one right up to the
+point a factor leaves representable range. Range was the whole failure
+mode, which is what `_factored_decay_is_safe` now bounds.
