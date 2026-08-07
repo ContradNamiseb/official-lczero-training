@@ -110,12 +110,17 @@ standard Leela data. At 346 tars that is 3,460,000. Getting this wrong does not
 produce an error — it produces a run that quietly loops over a fraction of your
 data.
 
-**`gradient_accumulation_steps` buys effective batch size without memory.** On
-an iGPU the batch ceiling is low (batch 48 already fails on 11.7 GB shared),
-and a batch-32 gradient is mostly noise. Accumulation sums N micro-batches into
-one optimizer step at the peak memory of a single one. Measured here: 28.7
-pos/sec at 1x versus 32.9 at 8x, so an effective batch of 256 costs nothing but
-step latency. See [metrics.md](metrics.md#effective-batch).
+**`gradient_accumulation_steps` buys effective batch size cheaply, but not
+freely.** On an iGPU the batch ceiling is low (batch 48 already fails on 11.7 GB
+shared) and a batch-32 gradient is mostly noise, so accumulation is the only way
+to a usable batch. It sums N micro-batches into one optimizer step at
+essentially the memory of a single one, and throughput is flat to slightly
+better: 28.7 pos/sec at 1x versus 32.9 at 8x.
+
+"Essentially" is doing work in that sentence. On a 11.7 GB machine with ~4.5 GB
+free at rest, `8` ran 47 steps and then died with a host OOM; `4` is the shipped
+default. **Raise it one notch at a time and give each setting a few thousand
+steps before trusting it.** See [metrics.md](metrics.md#effective-batch).
 
 ### Adding a test split
 
