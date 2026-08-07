@@ -247,7 +247,4 @@ deliberately excluded, so those are safe to change between runs.
 
 * `compute_dtype` must be `F32`. F16 is not implemented and the model raises
   rather than training something subtly wrong.
-* Loading an exported `.pb.gz` in the lc0 engine itself has not been verified
-  here — no lc0 binary was available. The export is byte-format correct and
-  round-trips through the importer, but the engine has not confirmed it.
 * Multi-GPU is not supported.
