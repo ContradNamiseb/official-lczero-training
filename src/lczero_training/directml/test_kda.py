@@ -16,6 +16,7 @@ from flax import nnx
 
 from lczero_training.directml import layers
 from lczero_training.directml.kda import (
+    KDA_LOG_DECAY_FLOOR,
     KDA_TRAVERSALS,
     KdaLocalConv,
     KDALogDecay,
@@ -152,6 +153,72 @@ def test_recurrence_gradients_are_finite() -> None:
     for tensor in (query, key, value):
         assert tensor.grad is not None
         assert bool(torch.isfinite(tensor.grad).all())
+
+
+@pytest.mark.parametrize("chunk_size", [4, 8, 16])
+@pytest.mark.parametrize("saturated_fraction", [0.25, 0.5, 1.0])
+def test_recurrence_is_finite_with_a_saturated_gate(
+    saturated_fraction: float, chunk_size: int
+) -> None:
+    """The forget gate sitting on its floor is a routine input, not a corner.
+
+    Live runs report 6-24% of gate elements pinned at KDA_LOG_DECAY_FLOOR,
+    and a channel saturated across a whole chunk drives the within-chunk
+    cumulative sum to chunk_size * -10.
+
+    Regression test for two separate breaks in the factored-decay form,
+    which replaces exp(cum[i] - cum[j]) with exp(cum[i]) * exp(-cum[j]):
+
+    * Written as `key / exp(cumulative)` the forward pass is right, but
+      division backpropagates as -grad * key / exp(cumulative)**2 and
+      exp(-80)**2 underflows float32 to zero, so the log_decay gradient
+      became -inf. The multiply has the same value and a finite derivative.
+    * The factored form itself only holds while exp(chunk_size * 10) fits
+      in the dtype. float32 tops out at exp(88.7), so chunk_size 16 --
+      the default -- overflowed to inf, and the following matmul turned
+      that into 0 * inf = NaN inside entries the causal mask keeps. The
+      whole network went to NaN. kda_recurrence now falls back to pairwise
+      differences when the chunk size makes the split unsafe.
+
+    Both needed conditions the shipped suites never combined: log_decay is
+    drawn from [-2, -0.001] elsewhere, so `cumulative` never approached the
+    floor, and test_recurrence_gradients_are_finite does not set
+    requires_grad on log_decay at all.
+    """
+    generator = torch.Generator().manual_seed(11)
+    shape = (2, 16, 2, 8)
+    query = torch.randn(shape, generator=generator, requires_grad=True)
+    key = torch.randn(shape, generator=generator, requires_grad=True)
+    value = torch.randn((2, 16, 2, 8), generator=generator, requires_grad=True)
+    beta = torch.sigmoid(torch.randn((2, 16, 2), generator=generator))
+
+    decay = -torch.rand(shape, generator=generator) * 2.0 - 0.001
+    saturated = torch.rand(shape, generator=generator) < saturated_fraction
+    decay = torch.where(
+        saturated, torch.full_like(decay, KDA_LOG_DECAY_FLOOR), decay
+    )
+    log_decay = decay.clone().requires_grad_(True)
+
+    output = kda_recurrence(
+        query, key, value, log_decay, beta, chunk_size=chunk_size
+    )
+    assert bool(torch.isfinite(output).all()), (
+        f"forward produced non-finite at chunk_size {chunk_size}"
+    )
+
+    output.square().mean().backward()
+
+    for name, tensor in (
+        ("query", query),
+        ("key", key),
+        ("value", value),
+        ("log_decay", log_decay),
+    ):
+        assert tensor.grad is not None, f"{name} got no gradient"
+        assert bool(torch.isfinite(tensor.grad).all()), (
+            f"{name} gradient is not finite at "
+            f"{saturated_fraction:.0%} gate saturation"
+        )
 
 
 # --------------------------------------------------------------------------

@@ -89,6 +89,107 @@ KDA_LOG_DECAY_FLOOR = -10.0
 
 BOARD_SQUARES = 64
 
+# Cached constants for kda_recurrence: the two causal masks (diagonal
+# included for the query/key attention, strict for the key/key one) and
+# the identity matrix the Neumann series starts from. They depend only on
+# (chunk_size, dtype, device), so building them once avoids re-allocating
+# them on every call -- on DirectML every eager allocation counts.
+_RECURRENCE_CONSTANTS: dict[
+    tuple[int, torch.dtype, torch.device],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+
+
+def _recurrence_constants(
+    chunk_size: int, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Causal masks and identity for one (chunk_size, dtype, device)."""
+    key = (chunk_size, dtype, device)
+    cached = _RECURRENCE_CONSTANTS.get(key)
+    if cached is None:
+        ones = np.ones((chunk_size, chunk_size), dtype=np.float32)
+
+        def to_device(array: np.ndarray) -> torch.Tensor:
+            # Built on the host and copied over: torch.eye on a DirectML
+            # device follows a broken fallback path (see
+            # layers.identity_matrix), and torch.tril has no verified
+            # DirectML kernel.
+            return torch.from_numpy(array).to(dtype=dtype, device=device)
+
+        cached = (
+            to_device(np.tril(ones)),
+            to_device(np.tril(ones, k=-1)),
+            to_device(np.eye(chunk_size, dtype=np.float32)),
+        )
+        _RECURRENCE_CONSTANTS[key] = cached
+    return cached
+
+
+def _factored_decay_is_safe(chunk_size: int, dtype: torch.dtype) -> bool:
+    """Can exp(cum[i] - cum[j]) be split into exp(cum[i]) * exp(-cum[j])?
+
+    The split is what lets both intra-chunk matrices come out of a single
+    matmul, but it evaluates each factor on its own. Over one chunk the
+    cumulative sum bottoms out at ``chunk_size * KDA_LOG_DECAY_FLOOR``, so
+    ``exp(-cumulative)`` reaches ``exp(chunk_size * 10)`` -- and float32
+    tops out at exp(88.7). At the default chunk size of 16 that is
+    exp(160), which overflows to inf; the subsequent matmul then produces
+    0 * inf = NaN in entries the causal mask was going to keep, so masking
+    afterwards cannot repair it and the whole network goes to NaN.
+
+    The pairwise differences the slow path computes stay bounded whatever
+    the chunk size, because the mask discards the positive ones.
+    """
+    largest_exponent = math.log(torch.finfo(dtype).max)
+    # A little headroom: the products feeding the matmul are summed over
+    # key_dim, so the individual factors must stay clear of the ceiling.
+    return chunk_size * abs(KDA_LOG_DECAY_FLOOR) < largest_exponent - 8.0
+
+
+def _intra_chunk_attention_rows(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cumulative: torch.Tensor,
+    chunk_size: int,
+    batch: int,
+    chunks: int,
+    heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The two intra-chunk matrices, built from bounded pairwise decays."""
+    key_attention_rows = [
+        query.new_zeros((batch, chunks, heads, 1, chunk_size))
+    ]
+    query_attention_rows = []
+    for row in range(chunk_size):
+        cumulative_row = cumulative[:, :, :, row : row + 1, :]
+        query_decay = torch.exp(
+            cumulative_row - cumulative[:, :, :, : row + 1, :]
+        )
+        query_row = torch.sum(
+            query[:, :, :, row : row + 1, :]
+            * key[:, :, :, : row + 1, :]
+            * query_decay,
+            dim=-1,
+        )
+        query_row = layers.pad_last(query_row, chunk_size - row - 1)
+        query_attention_rows.append(query_row.unsqueeze(-2))
+
+        if row:
+            key_decay = torch.exp(cumulative_row - cumulative[:, :, :, :row, :])
+            key_row = torch.sum(
+                key[:, :, :, row : row + 1, :]
+                * key[:, :, :, :row, :]
+                * key_decay,
+                dim=-1,
+            )
+            key_row = layers.pad_last(key_row, chunk_size - row)
+            key_attention_rows.append(key_row.unsqueeze(-2))
+
+    return (
+        torch.cat(query_attention_rows, dim=3),
+        torch.cat(key_attention_rows, dim=3),
+    )
+
 
 def kda_recurrence(
     query: torch.Tensor,
@@ -106,9 +207,11 @@ def kda_recurrence(
 
     Equivalent to scanning the recurrence one token at a time, but each
     chunk is solved in closed form with dense matmuls, so the sequential
-    depth drops from ``tokens`` to ``tokens / chunk_size``. Mirrors
-    kda_recurrence() in model/kda.py; ``chunk_size`` is a concrete Python
-    int so both loops below unroll exactly as the JAX reference's do.
+    depth drops from ``tokens`` to ``tokens / chunk_size``. Algebraically
+    identical to kda_recurrence() in model/kda.py, but reassociated so
+    that every state-independent product is batched over all chunks: on
+    DirectML each eager kernel launch and allocation costs far more than
+    the redundant arithmetic this reassociation introduces.
     """
     query = query.float()
     key = key.float()
@@ -159,47 +262,55 @@ def kda_recurrence(
     # dim, and DirectML's flip faults on a negative axis.
     cumulative = layers.cumsum(log_decay, 3)
     final = cumulative[:, :, :, -1:, :]
-    decayed_query = query * torch.exp(cumulative)
-    decayed_key = key * torch.exp(cumulative)
-    trailing_key = key * torch.exp(final - cumulative)
 
-    key_attention_rows = [
-        query.new_zeros((batch, chunks, heads, 1, chunk_size))
-    ]
-    query_attention_rows = []
-    for row in range(chunk_size):
-        cumulative_row = cumulative[:, :, :, row : row + 1, :]
-        query_keys = key[:, :, :, : row + 1, :]
-        query_decay = torch.exp(
-            cumulative_row - cumulative[:, :, :, : row + 1, :]
+    exp_cumulative = torch.exp(cumulative)
+    decayed_query = query * exp_cumulative
+    decayed_key = key * exp_cumulative
+    exp_final = torch.exp(final)
+    final_decay = exp_final.transpose(-1, -2)
+
+    _, _, identity = _recurrence_constants(
+        chunk_size, query.dtype, query.device
+    )
+
+    if _factored_decay_is_safe(chunk_size, query.dtype):
+        # Fast path. The within-chunk decay exp(cum[i] - cum[j]) factors
+        # into exp(cum[i]) * exp(-cum[j]), which lets both intra-chunk
+        # matrices come out of one (2C, K) @ (K, C) matmul instead of the
+        # row-by-row loop below (~6 kernel launches per row on ragged
+        # slices). The strict mask is also what keeps key_attention
+        # nilpotent, which the Neumann series relies on.
+        #
+        # exp(-cumulative), NOT key / exp(cumulative). The two agree in the
+        # forward pass, but division backpropagates as
+        # -grad * key / exp(cum)**2, and exp(-80)**2 underflows float32 to
+        # exactly zero -- so the gradient of a saturated channel becomes
+        # -inf and poisons log_decay on the next optimizer step. Live runs
+        # report 6-24% of gate elements sitting on the floor, so that is a
+        # routine input. The multiply's gradient is -key * exp(-cum):
+        # large, but finite.
+        mask_incl, mask_strict, _ = _recurrence_constants(
+            chunk_size, query.dtype, query.device
         )
-        query_row = torch.sum(
-            query[:, :, :, row : row + 1, :] * query_keys * query_decay,
-            dim=-1,
+        inverse_decayed_key = key * torch.exp(-cumulative)
+        trailing_key = inverse_decayed_key * exp_final
+        decayed_qk = torch.cat([decayed_query, decayed_key], dim=-2)
+        full_attention = decayed_qk @ inverse_decayed_key.transpose(-1, -2)
+        query_attention = full_attention[..., :chunk_size, :] * mask_incl
+        key_attention = full_attention[..., chunk_size:, :] * mask_strict
+    else:
+        # Slow path, for chunk sizes where the factored form would
+        # overflow. Builds the two matrices a row at a time from the
+        # pairwise differences, which stay bounded by construction.
+        trailing_key = key * torch.exp(final - cumulative)
+        query_attention, key_attention = _intra_chunk_attention_rows(
+            query, key, cumulative, chunk_size, batch, chunks, heads
         )
-        query_row = layers.pad_last(query_row, chunk_size - row - 1)
-        query_attention_rows.append(query_row.unsqueeze(-2))
-
-        if row:
-            key_columns = key[:, :, :, :row, :]
-            key_decay = torch.exp(cumulative_row - cumulative[:, :, :, :row, :])
-            key_row = torch.sum(
-                key[:, :, :, row : row + 1, :] * key_columns * key_decay,
-                dim=-1,
-            )
-            key_row = layers.pad_last(key_row, chunk_size - row)
-            key_attention_rows.append(key_row.unsqueeze(-2))
-
-    key_attention = torch.cat(key_attention_rows, dim=3)
-    query_attention = torch.cat(query_attention_rows, dim=3)
 
     # Invert the unit lower triangular (I + diag(beta) @ key_attention) with
     # a Neumann series; key_attention is strictly lower triangular, so it is
     # nilpotent and the series is exact after `chunk_size` terms.
     nilpotent = -beta * key_attention
-    identity = layers.identity_matrix(
-        chunk_size, dtype=query.dtype, device=query.device
-    )
     inverse = identity + nilpotent
     power = nilpotent
     span = 2
@@ -210,23 +321,45 @@ def kda_recurrence(
 
     beta_value = beta * value
     beta_key = beta * decayed_key
-    final_decay = torch.exp(final).transpose(-1, -2)
+
+    # Hoist every state-independent product out of the sequential scan.
+    # delta = inverse @ (beta_value - beta_key @ state) distributes into
+    # inverse @ beta_value - (inverse @ beta_key) @ state, and both inverse
+    # products batch over all chunks in one matmul when the key and value
+    # halves are concatenated along the feature axis.
+    inverse_kb = inverse @ torch.cat([beta_key, beta_value], dim=-1)
+    # (B, chunks, H, C, K + V): key half is inverse @ beta_key, value half
+    # inverse @ beta_value.
+
+    # Substituting the expanded delta into the state update makes it affine
+    # in the state:
+    #   state' = state * final_decay + trailing_key^T @ delta
+    #          = state * final_decay + state_bias - state_matrix @ state,
+    # so the loop carries one matmul per chunk instead of four.
+    correction = trailing_key.transpose(-1, -2) @ inverse_kb
+    state_matrix = correction[..., :key_dim]  # (B, chunks, H, K, K)
+    state_bias = correction[..., key_dim:]  # (B, chunks, H, K, V)
+
+    # The per-chunk output decayed_query @ state + query_attention @ delta
+    # expands the same way into query_bias + reduced_query @ state.
+    query_correction = query_attention @ inverse_kb
+    reduced_query = decayed_query - query_correction[..., :key_dim]
+    query_bias = query_correction[..., key_dim:]  # (B, chunks, H, C, V)
 
     state = query.new_zeros((batch, heads, key_dim, value_dim))
-    outputs = []
+    entered_states = []
     for index in range(chunks):
-        delta = inverse[:, index] @ (
-            beta_value[:, index] - beta_key[:, index] @ state
-        )
-        outputs.append(
-            decayed_query[:, index] @ state + query_attention[:, index] @ delta
-        )
+        entered_states.append(state)
         state = (
             state * final_decay[:, index]
-            + trailing_key[:, index].transpose(-1, -2) @ delta
+            + state_bias[:, index]
+            - state_matrix[:, index] @ state
         )
 
-    output = torch.stack(outputs, dim=1) / math.sqrt(key_dim)
+    # Stacking the states at the entry of every chunk computes all chunk
+    # outputs with one more batched matmul instead of two per chunk.
+    output = query_bias + reduced_query @ torch.stack(entered_states, dim=1)
+    output = output / math.sqrt(key_dim)
     output = output.permute(0, 1, 3, 2, 4)
     output = output.reshape(batch, chunks * chunk_size, heads, value_dim)
     return output[:, :tokens]
