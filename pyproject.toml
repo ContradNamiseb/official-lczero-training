@@ -56,8 +56,6 @@ lc0-directml-train = "lczero_training.commands.directml_train:main"
 lc0-directml-export = "lczero_training.commands.directml_export:main"
 lc0-directml-daemon = "lczero_training.commands.directml_daemon:main"
 lc0-directml-tui = "lczero_training.commands.directml_tui:main"
-lc0-directml-daemon = "lczero_training.commands.directml_daemon:main"
-lc0-directml-tui = "lczero_training.commands.directml_tui:main"
 
 [project.optional-dependencies]
 # CUDA JAX training. Kept out of the default install because the CUDA plugin

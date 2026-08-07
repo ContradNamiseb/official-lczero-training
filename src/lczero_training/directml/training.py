@@ -206,11 +206,6 @@ def train(
         should_report = bool(reporters) and (
             index % max(report_every, 1) == 0 or last
         )
-        if diagnostics:
-            derived_metrics.set_kda_stats_collection(
-                model, should_log or should_report
-            )
-
         # Re-evaluated every step: the schedule may ramp or cycle, and the
         # rate for a resumed run depends on the restored global step.
         learning_rate = schedule(step)
@@ -219,7 +214,17 @@ def train(
         optimizer.zero_grad(set_to_none=True)
 
         metrics: dict[str, torch.Tensor] = {}
-        for _ in range(accumulation):
+        for micro in range(accumulation):
+            final_micro = micro == accumulation - 1
+            # Only the last micro-batch carries the diagnostics, so the KDA
+            # mixers capture stats on that pass alone. Enabling it for all
+            # of them would run the extra reductions `accumulation` times
+            # to produce a number that gets thrown away.
+            if diagnostics:
+                derived_metrics.set_kda_stats_collection(
+                    model, final_micro and (should_log or should_report)
+                )
+
             batch = next(batches)
             if started is None:
                 # Start timing only once the first batch is in hand. The
@@ -242,24 +247,37 @@ def train(
             (loss / accumulation).backward()
 
             if should_log or should_report:
-                # Diagnostics cost a few extra kernels and contribute
-                # nothing to the gradient, so they are computed only on
-                # steps that actually report.
-                if diagnostics:
-                    micro_metrics.update(
-                        _diagnostic_metrics(predictions, batch, model, loss_fn)
-                    )
-                # Summed on the device and divided once at the end: the
-                # reported numbers then describe the whole effective batch
-                # rather than whichever micro-batch happened to be last.
+                # Losses are summed across every micro-batch and divided
+                # below, so the reported value describes the whole
+                # effective batch rather than whichever one was last.
                 for name, value in micro_metrics.items():
                     prior = metrics.get(name)
                     metrics[name] = value if prior is None else prior + value
 
+            # Drop the activations before the next forward allocates. The
+            # graph itself is freed by backward, but the output tensors are
+            # not, and under DirectML the allocator does not reliably reuse
+            # a block that is still referenced. Only the last micro-batch's
+            # outputs are kept, for the diagnostics below.
+            del loss, micro_metrics
+            if not final_micro:
+                del predictions
+
         if metrics and accumulation > 1:
-            metrics = {
-                name: value / accumulation for name, value in metrics.items()
-            }
+            for name in metrics:
+                metrics[name] = metrics[name] / accumulation
+
+        if (should_log or should_report) and diagnostics:
+            # Once per step, on the last micro-batch's outputs -- not once
+            # per micro-batch. These are observational: parameter norms do
+            # not vary within a step at all, and an accuracy measured on
+            # one micro-batch is the same estimate the run reported before
+            # accumulation existed. Computing them 8x to average them cost
+            # 8x the kernels and 8x the allocation churn.
+            metrics.update(
+                _diagnostic_metrics(predictions, batch, model, loss_fn)
+            )
+        del predictions
 
         if max_grad_norm and max_grad_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(

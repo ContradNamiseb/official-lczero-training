@@ -149,7 +149,10 @@ data_loader {
     input: "test_chunk_unpacker"
     shuffling_frame_sampler {
       threads: 1
-      reservoir_size_per_thread: 5000
+      # Smaller than the train reservoir on purpose: this one only feeds
+      # --eval-batches batches every --eval-every steps, so a large one is
+      # host memory held idle almost all of the time.
+      reservoir_size_per_thread: 1000
       output {
         queue_capacity: 16
       }
@@ -233,10 +236,14 @@ training {
   max_grad_norm: 10.0
   # Batch 32 is the hard memory ceiling for this model on the Iris Xe (48
   # already OOMs), so the effective batch is bought with accumulation
-  # instead: 8 x 32 = 256 positions per optimizer step, at the peak memory
-  # of a single 32. Measured cost is nil -- 28.7 pos/sec at 1x versus 32.9
-  # at 8x, since one optimizer step is amortized over eight forwards.
-  gradient_accumulation_steps: 8
+  # instead, at the peak memory of a single 32.
+  #
+  # 4, not 8: a first attempt at 8 ran 47 steps and then died with a host
+  # OOM. This machine has 11.7 GB shared with the iGPU and roughly 4.5 GB
+  # free at rest, so headroom is thin. Raise it once a run has been stable
+  # for a few thousand steps -- the effective batch is this times
+  # tensor_generator.batch_size.
+  gradient_accumulation_steps: 4
 }
 model {
   defaults {

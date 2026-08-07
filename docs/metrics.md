@@ -53,9 +53,17 @@ last:
 learning the whole time and the log could not show it. **If you want to know
 whether a run is working, open the `-test` run in TensorBoard.**
 
-Once `gradient_accumulation_steps` is set, `-train` improves too: the reported
-numbers are averaged across every micro-batch in the step, so a run with
-`gradient_accumulation_steps: 8` reports on 256 positions rather than 32.
+Once `gradient_accumulation_steps` is set, the reported **losses** improve too:
+they are summed across every micro-batch and divided, so a run with
+`gradient_accumulation_steps: 8` reports a loss measured on 256 positions
+rather than 32.
+
+The **diagnostics** — policy accuracy, entropy, value accuracy, KDA stats,
+parameter norms — are still measured on a single micro-batch. Averaging them
+across all 8 would cost 8x the kernels and 8x the allocation churn to sharpen
+numbers that are observational rather than optimized, and parameter norms do
+not vary within a step at all. So `Policy Accuracy` stays as noisy as it was;
+read it from the `-test` run.
 
 ---
 

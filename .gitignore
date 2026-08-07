@@ -112,6 +112,14 @@ tf/proto/
 # Meson
 builddir/
 subprojects/
+# ...except the wraps and packagefiles, which the build needs from a fresh
+# clone. zlib in particular is required by the native Windows MSVC build.
+!subprojects/*.wrap
+!subprojects/packagefiles/
+
+# Training run artifacts
+*.log
+daemon-io.jsonl
 
 # LLM Agents
 # Use AGENTS.md; symlink other files to it if needed.
