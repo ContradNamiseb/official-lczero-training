@@ -86,9 +86,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Evaluate on the held-out split every N steps. Requires a config "
-            "with a chunk_source_splitter (see scripts/add_test_split.py). "
-            "0 disables evaluation."
+            "Evaluate on the held-out split every N global steps. Requires a "
+            "config with a chunk_source_splitter (see "
+            "scripts/add_test_split.py). The measurement runs in a child "
+            "process, so it costs this one no device memory. 0 disables."
         ),
     )
     parser.add_argument(
@@ -96,6 +97,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Batches per evaluation pass.",
+    )
+    parser.add_argument(
+        "--eval-device",
+        help=(
+            "Device for the eval worker. Defaults to --device. Use cpu if "
+            "this process leaves too little for a second one to allocate in."
+        ),
+    )
+    parser.add_argument(
+        "--eval-timeout",
+        type=float,
+        default=900.0,
+        help=(
+            "Seconds before a stuck eval worker is killed and the eval "
+            "skipped. Raise it for --eval-device cpu."
+        ),
     )
     parser.add_argument(
         "--kda-chunk-size",
@@ -254,9 +271,6 @@ def main(argv: list[str] | None = None) -> int:
     from lczero_training.directml import metrics as metrics_sinks
 
     reporters: list[metrics_sinks.ClosableReporter] = []
-    # Writers that must be flushed and closed but are not driven by the
-    # training loop's reporting cadence.
-    closed_reporters: list[metrics_sinks.ClosableReporter] = []
     tensorboard_dir = args.tensorboard or config.metrics.tensorboard_path
     if tensorboard_dir and tensorboard_dir.lower() != "off":
         # One directory per split, named after the run, so TensorBoard lists
@@ -270,6 +284,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         logging.info("TensorBoard disabled; no metrics will be written.")
+        tensorboard_dir = ""
+    # Folded back into the config, because the eval worker writes the test
+    # run from the config it is handed and has no --tensorboard of its own.
+    # Without this, --tensorboard would move the train run and leave the test
+    # run behind in whatever the config said.
+    config.metrics.tensorboard_path = tensorboard_dir
 
     # A split config exposes named outputs; a plain one exposes exactly one
     # with an empty alias.
@@ -298,35 +318,9 @@ def main(argv: list[str] | None = None) -> int:
 
     eval_hook = None
     if args.eval_every:
-        from lczero_training.directml.losses import LczeroLoss
-        from lczero_training.directml.training import evaluate
+        from lczero_training.directml import subprocess_eval
 
-        eval_batches = batches_from_loader(loader, device, "test")
-        eval_loss_fn = LczeroLoss(config.training.losses)
-        # Its own writer, so TensorBoard shows train and test as separate
-        # runs on shared axes -- the same layout the TF pipeline used.
-        test_reporter = metrics_sinks.TensorboardReporter(
-            metrics_sinks.run_logdir(
-                tensorboard_dir, config.name or "directml", "test"
-            )
-        )
-        # Deliberately NOT appended to `reporters`: those are driven by the
-        # training loop on every reporting step, which would interleave
-        # train metrics (and grad_norm/lr) into the test run. This writer is
-        # called only from eval_hook. It is closed alongside the others via
-        # closed_reporters below.
-        closed_reporters.append(test_reporter)
-
-        def eval_hook(step: int) -> None:
-            scalars = evaluate(
-                model=model,
-                loss_fn=eval_loss_fn,
-                batches=eval_batches,
-                batch_count=args.eval_batches,
-            )
-            if not scalars:
-                return
-            test_reporter(step, scalars)
+        def log_eval(step: int, scalars: dict[str, float]) -> None:
             logging.info(
                 "eval @ %d  %s",
                 step,
@@ -336,6 +330,21 @@ def main(argv: list[str] | None = None) -> int:
                     if name in ("total", "policy/main_ce", "value/winner")
                 ),
             )
+
+        # The forward passes run in a child process that exits, so they cost
+        # this one no device memory -- and the TensorBoard test run is written
+        # there too, which is why no writer for it is registered here.
+        eval_hook = subprocess_eval.make_eval_hook(
+            config=config,
+            model=model,
+            loader=loader,
+            config_filepath=args.config,
+            batch_count=args.eval_batches,
+            device_spec=args.eval_device or args.device,
+            kda_chunk_size=args.kda_chunk_size,
+            timeout=args.eval_timeout,
+            on_scalars=log_eval,
+        )
     try:
         for segment_steps in training_segments(
             restored.step, target_step, checkpoint_interval
@@ -377,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             loader.stop()
         except Exception:
             logging.exception("Data loader failed to stop cleanly")
-        metrics_sinks.close_all(reporters + closed_reporters)
+        metrics_sinks.close_all(reporters)
 
     if failed and final_step > restored.step:
         written = checkpoint_io.save(

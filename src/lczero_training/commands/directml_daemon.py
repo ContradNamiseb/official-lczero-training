@@ -86,9 +86,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--eval-every",
         type=int,
         default=0,
-        help="Evaluate on the held-out split every N steps. Needs a split config.",
+        help=(
+            "Evaluate on the held-out split every N global steps. Needs a "
+            "split config. The measurement runs in a child process, so it "
+            "costs the trainer no device memory. 0 disables."
+        ),
     )
     parser.add_argument("--eval-batches", type=int, default=50)
+    parser.add_argument(
+        "--eval-device",
+        help=(
+            "Device for the eval worker. Defaults to --device. Use cpu if "
+            "the trainer leaves too little for a second process to allocate "
+            "in -- slower, but it cannot compete for device memory."
+        ),
+    )
+    parser.add_argument(
+        "--eval-timeout",
+        type=float,
+        default=900.0,
+        help=(
+            "Seconds before a stuck eval worker is killed and the eval "
+            "skipped. Raise it for --eval-device cpu."
+        ),
+    )
     return parser
 
 
@@ -120,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
+        eval_device=args.eval_device,
+        eval_timeout=args.eval_timeout,
         data_file_count=args.data_file_count,
         data_phase_step_interval=args.data_phase_step_interval,
         gc_every=args.gc_every,

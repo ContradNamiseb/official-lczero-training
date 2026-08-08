@@ -8,47 +8,12 @@ which is what the host-transfer and drop-the-optimizer stages address. Every
 cause is covered here.
 """
 
-import pathlib
-
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from google.protobuf import text_format
-
+from lczero_training.directml.conftest import make_tiny_config as _tiny_config
 from lczero_training.directml.daemon import DirectMlTrainingDaemon
-from proto.root_config_pb2 import RootConfig
-
-_CONFIG_PATH = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "docs"
-    / "example_kda_real_import.textproto"
-)
-
-
-def _tiny_config() -> RootConfig:
-    config = RootConfig()
-    text_format.Parse(_CONFIG_PATH.read_text(), config)
-    config.model.embedding.dense_size = 8
-    config.model.embedding.embedding_size = 16
-    config.model.embedding.dff = 16
-    del config.model.encoder.mixer_pattern[1:]
-    config.model.encoder.num_blocks = 1
-    config.model.encoder.d_model = 16
-    config.model.encoder.dff = 16
-    config.model.encoder.heads = 8
-    config.model.encoder.kda.key_dim = 8
-    config.model.encoder.kda.value_dim = 8
-    config.model.encoder.kda.gate_rank = 8
-    config.model.shared_policy_embedding_size = 16
-    for head in config.model.policy_head:
-        head.d_model = 16
-    for head in config.model.value_head:
-        head.num_channels = 8
-    for head in config.model.movesleft_head:
-        head.num_channels = 8
-    return config
-
 
 # Deliberately not constructing a daemon: __init__ starts a thread that
 # reads sys.stdin, and a stray one of those breaks any later test that

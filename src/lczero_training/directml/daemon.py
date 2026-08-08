@@ -46,6 +46,8 @@ class DirectMlTrainingDaemon:
         output: Optional[str] = None,
         eval_every: int = 0,
         eval_batches: int = 50,
+        eval_device: Optional[str] = None,
+        eval_timeout: float = 900.0,
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
         gc_every: int = 0,
@@ -61,11 +63,12 @@ class DirectMlTrainingDaemon:
         self._output = output
         self._eval_every = eval_every
         self._eval_batches = eval_batches
+        self._eval_device = eval_device
+        self._eval_timeout = eval_timeout
         self._data_file_count = data_file_count
         self._data_phase_step_interval = data_phase_step_interval
         self._gc_every = gc_every
 
-        self._extra_reporters: list = []
         self._stop = threading.Event()
         self._communicator = Communicator(self, sys.stdin, sys.stdout)
         self._communicator_thread = threading.Thread(
@@ -261,9 +264,15 @@ class DirectMlTrainingDaemon:
         )
 
     def _make_eval_hook(
-        self, config, model, device, loader, has_split: bool, device_name: str
+        self, config, model, loader, has_split: bool, device_name: str
     ):
-        """An eval callback, or None when evaluation is off or impossible."""
+        """An eval callback, or None when evaluation is off or impossible.
+
+        The measurement itself runs in a child process that exits, so it
+        costs the trainer no device memory at all -- see
+        ``directml/subprocess_eval.py`` for why that matters more than it
+        sounds. Nothing here touches the device, including the batches.
+        """
         if not self._eval_every:
             return None
         if not has_split:
@@ -273,33 +282,9 @@ class DirectMlTrainingDaemon:
             )
             return None
 
-        from . import metrics as metrics_sinks
-        from .losses import LczeroLoss
-        from .training import batches_from_loader, evaluate
+        from . import subprocess_eval
 
-        eval_batches = batches_from_loader(loader, device, "test")
-        eval_loss_fn = LczeroLoss(config.training.losses)
-        writer = metrics_sinks.TensorboardReporter(
-            metrics_sinks.run_logdir(
-                config.metrics.tensorboard_path,
-                config.name or "directml",
-                "test",
-            )
-        )
-        # Driven only from here, never from the training loop's reporters,
-        # so train metrics cannot leak into the test run.
-        self._extra_reporters.append(writer)
-
-        def hook(step: int) -> None:
-            scalars = evaluate(
-                model=model,
-                loss_fn=eval_loss_fn,
-                batches=eval_batches,
-                batch_count=self._eval_batches,
-            )
-            if not scalars:
-                return
-            writer(step, scalars)
+        def report(step: int, scalars: dict[str, float]) -> None:
             self._emit(
                 phase=TrainingPhase.TRAINING.value,
                 step=step,
@@ -307,7 +292,17 @@ class DirectMlTrainingDaemon:
                 message=f"eval total={scalars.get('total', float('nan')):.4f}",
             )
 
-        return hook
+        return subprocess_eval.make_eval_hook(
+            config=config,
+            model=model,
+            loader=loader,
+            config_filepath=self._config_filepath,
+            batch_count=self._eval_batches,
+            device_spec=self._eval_device or self._device_spec,
+            kda_chunk_size=self._kda_chunk_size,
+            timeout=self._eval_timeout,
+            on_scalars=report,
+        )
 
     # --- reporting ---------------------------------------------------------
 
@@ -466,7 +461,7 @@ class DirectMlTrainingDaemon:
         )
 
         eval_hook = self._make_eval_hook(
-            config, model, device, loader, has_split, device_name
+            config, model, loader, has_split, device_name
         )
 
         progress: dict[str, int] = {"step": start_step}
@@ -523,7 +518,7 @@ class DirectMlTrainingDaemon:
                 loader.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("Data loader failed to stop cleanly")
-            metrics_sinks.close_all(reporters + self._extra_reporters)
+            metrics_sinks.close_all(reporters)
 
         self._emit(
             phase=(

@@ -423,6 +423,69 @@ def test_step_releases_its_tensors_before_the_next_one():
     )
 
 
+def _eval_steps(*, eval_every, steps, start_step, calls_per_segment=1):
+    """The global steps `train` evaluates at, over one or more segments."""
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.training import train
+
+    config = _tiny_training_config()
+    torch.manual_seed(1234)
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+    seen: list[int] = []
+    step = start_step
+    batches = iter(_fixed_batches(steps * calls_per_segment, 4, seed=7))
+    for _ in range(calls_per_segment):
+        step = train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=batches,
+            device=torch.device("cpu"),
+            start_step=step,
+            steps=steps,
+            log_every=0,
+            diagnostics=False,
+            eval_hook=seen.append,
+            eval_every=eval_every,
+        )
+    return seen
+
+
+def test_evaluation_fires_on_the_global_step_not_the_segment_index():
+    """The cadence bug that made eval ten times more expensive than asked.
+
+    `train` is called once per checkpoint interval, so the loop index
+    restarts at 0 every 1,000 steps. The hook used to fire on
+    `index % eval_every == 0 or last`, which for any eval_every above the
+    interval meant the first and last step of every segment -- and every
+    eval permanently cost the trainer device memory it could not reclaim.
+    Four segments of 5 with eval_every 10 must evaluate at 10 and 20, not
+    eight times.
+    """
+    seen = _eval_steps(
+        eval_every=10, steps=5, start_step=0, calls_per_segment=4
+    )
+
+    assert seen == [10, 20]
+
+
+def test_evaluation_counts_from_the_resumed_step():
+    """A run resumed at 190,705 must still evaluate on multiples of 100, so
+    the test series lands on the same steps across restarts."""
+    seen = _eval_steps(
+        eval_every=100, steps=120, start_step=190_705, calls_per_segment=1
+    )
+
+    assert seen == [190_800]
+
+
+def test_evaluation_off_by_default():
+    assert _eval_steps(eval_every=0, steps=4, start_step=0) == []
+
+
 def test_gc_every_runs_a_collection_on_schedule():
     """The hook must fire, and only on the configured cadence."""
     import lczero_training.directml.training as training_module

@@ -103,11 +103,44 @@ Everything the guide recommends short of a subprocess is **already done**:
 Since DX12 memory returns to the OS solely on process exit, the robust
 architecture is to stop fighting the allocator and restart around it:
 
-1. **Evaluation in a subprocess.** Still open — see §4.2. `--eval-every`
-   runs eval inside the training process, and the second data pipeline sits
-   resident between evaluations. Spawning a worker that loads the exported
-   `.pb.gz`, evaluates, writes TensorBoard and exits gives a guaranteed
-   flush.
+1. **Evaluation in a subprocess.** **Done.**
+   `directml/subprocess_eval.py` (trainer side) and
+   `commands/directml_eval_worker.py` (the worker). Both trainers use it —
+   the daemon and `directml_train`.
+
+   The worker gets a weights file and a batch file rather than the exported
+   `.pb.gz` the guide suggested, which turned out to matter: a worker with
+   its own data pipeline would pay the four-minute loader startup on every
+   eval. The trainer already has the test pipeline warm, so it pulls the
+   batches as **numpy** and writes them out. Measured: ~2.7 s end to end
+   for the whole spawn on the real device, tiny model.
+
+   * The trainer now moves **no** test batch to the device. The old
+     `batches_from_loader(loader, device, "test")` did it 50 times per eval,
+     and every one of those blocks was permanent.
+   * The worker writes the `-test` TensorBoard run itself, so no writer for
+     it stays open in the trainer (`_extra_reporters` is gone).
+   * It sets `set_kda_stats_collection(model, True)` explicitly. In-process
+     eval got the gate diagnostics by accident, from whatever the training
+     loop had last left the flag at; out of process nothing sets it.
+   * A failed or hung worker (`--eval-timeout`, default 900 s) is logged and
+     the eval skipped. The stale `scalars.json` is deleted before each spawn
+     so a dead worker cannot hand back the previous eval's numbers at the
+     wrong step.
+   * `--eval-device cpu` exists because the worker allocates while the
+     trainer still holds 3.8 GB. It fits on this machine; if a future model
+     does not, that flag is the escape hatch.
+
+   **Also fixed, and probably the bigger win:** `--eval-every` counted the
+   within-segment loop index, which restarts every `steps_per_network`
+   steps. `--eval-every 5000` against 1,000-step segments evaluated at the
+   first and last step of every segment — every ~500 steps, ten times more
+   often than asked. The live run had been paying that since eval was
+   added. It now counts global steps.
+
+   What this does *not* remove is the test data pipeline: it stays resident
+   in the trainer, because it is what produces the batches. Its cost is
+   host memory in the C++ loader, not device blocks that strand a heap.
 2. **Supervised restart of the trainer.** **Done.**
    `commands/directml_supervisor.py`, reached with
    `lc0-directml-tui --supervise` or run directly. The daemon already
@@ -189,11 +222,16 @@ after some OOMs is unchanged and still unexplained — possibly the forced
 `gc.collect()` running while loader threads hold locks. It is caught and
 reported by the `finally` in `run()`, so it costs nothing but a log line.
 
-### 4.2 Evaluation still runs in the training process
+### 4.2 The memory work has not been measured end to end
 
-§3.1, now the largest remaining piece of the memory work. `--eval-every`
-holds a second data pipeline resident between evaluations, inside the
-process that cannot give memory back.
+Every piece of §3 is in and tested, but the number that matters — how many
+steps a supervised run now sustains, and whether the scheduled restart
+arrives before the wall — needs a real overnight run. Expect the eval
+cadence fix alone to change the shape of it, since the live run had been
+evaluating ten times more often than intended.
+
+The eval curve in TensorBoard will get sparser at the step this landed.
+That is the fix, not a regression.
 
 ### 4.3 Where a NaN came from
 
@@ -266,5 +304,5 @@ absolute times drift several percent with background load.
 * `docs/kda_split.textproto` — the live config.
 
 Tests: `.\.venv-directml\Scripts\python.exe -m pytest src\lczero_training -q`
-(222 passed, 1 skipped, ~3 min). `src/lczero_training/conftest.py` handles
+(231 passed, 1 skipped, ~3 min). `src/lczero_training/conftest.py` handles
 the WSL `.so` symlink, so no `--ignore` is needed any more.

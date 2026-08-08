@@ -184,6 +184,12 @@ def train(
     ``reporters`` receive ``(step, scalars)`` every ``report_every`` steps --
     TensorBoard and the TUI daemon both hook in this way. Metrics are only
     pulled off the device on steps that actually report.
+
+    ``eval_hook`` fires on global steps divisible by ``eval_every``, so the
+    cadence is the same whether this is called once for 20,000 steps or
+    twenty times for 1,000. A run shorter than ``eval_every`` that straddles
+    no multiple of it therefore evaluates not at all, which is what "every N
+    steps" means.
     """
     loss_fn = LczeroLoss(config.training.losses)
     max_grad_norm = config.training.max_grad_norm
@@ -363,9 +369,16 @@ def train(
 
         # Evaluation runs after the step, so the reported test metrics
         # correspond to the weights the matching train metrics describe.
-        if eval_hook is not None and eval_every > 0:
-            if index % eval_every == 0 or last:
-                eval_hook(step)
+        #
+        # On the global step, not `index`. This used to read
+        # `index % eval_every == 0 or last`, and `index` restarts at 0 in
+        # every call -- which is once per checkpoint interval. With
+        # steps_per_network at 1,000, any --eval-every above that evaluated
+        # at the first and last step of every segment: `--eval-every 5000`
+        # meant an eval every ~500 steps, ten times more often than asked,
+        # each one a permanent slice of the trainer's device memory.
+        if eval_hook is not None and eval_every > 0 and step % eval_every == 0:
+            eval_hook(step)
 
     elapsed = time.perf_counter() - started if started is not None else 0.0
     if steps:

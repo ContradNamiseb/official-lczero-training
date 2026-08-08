@@ -24,9 +24,12 @@ cost nothing.
 Two runs appear in TensorBoard when a test split is configured:
 
 * **`-train`** — measured on the batch just trained on. Noisy by nature.
-* **`-test`** — measured on held-out data every `--eval-every` steps, averaged
-  over `--eval-batches` batches. Much smoother, and the only honest read on
-  generalization.
+* **`-test`** — measured on held-out data every `--eval-every` **global**
+  steps, averaged over `--eval-batches` batches. Much smoother, and the only
+  honest read on generalization. Written by a child process, not the trainer;
+  see [directml-windows.md](directml-windows.md#2-train) for why. Points
+  before that change landed are ~10x denser than the flag asked for, because
+  the cadence was counted per checkpoint segment rather than globally.
 
 **The gap between them is the point.** Train falling while test flattens or
 rises is overfitting, and no single metric will tell you that on its own.

@@ -203,13 +203,40 @@ Useful flags on both:
 |---|---|
 | `--kda-chunk-size 8` | ~2.4x faster than the default 16, and the lowest memory. Mathematically identical — see below |
 | `--grad-accum N` | override `gradient_accumulation_steps` |
-| `--eval-every N` | evaluate on the held-out split. Needs a split config |
+| `--eval-every N` | evaluate on the held-out split every N **global** steps. Needs a split config |
+| `--eval-batches N` | batches per evaluation (default 50) |
+| `--eval-device D` | device for the eval worker. Defaults to `--device`; `cpu` if a second process cannot allocate |
+| `--eval-timeout S` | kill a stuck eval worker after S seconds and skip the eval (default 900) |
 | `--target-step N` | absolute step to stop at, checkpointing along the way |
 
 The first batch takes a few minutes — the loader indexes every tar and fills
 its shuffle pool before yielding anything. `First batch after Ns of data loader
 startup` in the log marks the end of it, and that time is excluded from
 ms/step.
+
+**Evaluation runs in a child process.** It used to run inline: 50 forward
+passes on the training device every `--eval-every` steps, all of which the
+trainer could never get back. Now the trainer writes the weights and the test
+batches to a scratch directory — host-side only, it no longer moves a single
+test batch to the device — and
+[`directml_eval_worker`](../src/lczero_training/commands/directml_eval_worker.py)
+does the forward passes, writes the `-test` TensorBoard run, and exits, which
+is what returns the memory. Training pauses for the few seconds it takes. A
+worker that fails or hangs is logged and the evaluation skipped; a measurement
+is never worth a run.
+
+Two consequences worth knowing:
+
+* `--eval-every` counts **global** steps. It used to count the loop index,
+  which restarts every `steps_per_network` steps, so any value above that
+  evaluated at the first and last step of every 1,000 — `--eval-every 5000`
+  really meant every ~500 steps, ten times more often than asked, each one a
+  permanent slice of device memory. If your eval curve suddenly has ten times
+  fewer points than it used to, that is this.
+* The worker allocates on the device while the trainer still holds its own
+  3.8 GB. That fits here, but if you see `the eval worker exited with code 1`
+  with an allocation failure in the log, pass `--eval-device cpu` and raise
+  `--eval-timeout`. Correctness is identical; only the speed differs.
 
 ### 3. Watch it
 
