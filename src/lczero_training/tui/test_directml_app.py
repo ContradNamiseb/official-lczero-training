@@ -216,6 +216,96 @@ async def test_kda_metrics_are_routed_out_of_the_losses_dict():
         assert not any(k.startswith("KDA/") for k in app._history)
 
 
+def test_sparkline_survives_a_nan():
+    """The exact crash: one NaN ended a 4,250-step run.
+
+    NaN passes through min() and max() untouched -- every comparison with
+    it is False -- so it reaches int() and raises ValueError there.
+    Textual treats that as fatal and the app owns the daemon, so training
+    died with the display.
+    """
+    from lczero_training.tui.directml_app import _spark
+
+    series = [3.6, 3.2, float("nan"), 3.4, 3.5, 3.3]
+    rendered = _spark(series)
+
+    assert len(rendered) == len(series)
+    assert "·" in rendered, "the NaN should show as a gap"
+    assert any(char in rendered for char in _spark([1.0, 2.0]))
+
+
+def test_sparkline_handles_an_all_nan_series():
+    from lczero_training.tui.directml_app import _spark
+
+    assert _spark([float("nan")] * 4) == "·" * 4
+
+
+def test_sparkline_handles_infinities():
+    from lczero_training.tui.directml_app import _spark
+
+    rendered = _spark([1.0, float("inf"), 2.0, float("-inf")])
+    assert len(rendered) == 4
+    assert rendered.count("·") == 2
+
+
+def test_sparkline_handles_a_flat_series_with_a_nan():
+    from lczero_training.tui.directml_app import _spark
+
+    rendered = _spark([2.0, 2.0, float("nan"), 2.0])
+    assert len(rendered) == 4
+    assert rendered.count("·") == 1
+
+
+def test_trend_ignores_non_finite_samples():
+    from lczero_training.tui.directml_app import _trend
+
+    series = [5.0, 5.0, 5.0, float("nan"), 1.0, 1.0, 1.0]
+    assert "↓" in _trend(series).plain
+
+
+@pytest.mark.anyio
+async def test_a_nan_metric_does_not_kill_the_app():
+    """End to end: a NaN in the payload must not stop the run."""
+    app = _app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        payload = _payload()
+        payload.losses["total"] = float("nan")
+        await app.on_training_metrics(payload)
+        await pilot.pause()
+
+        text = _text_of(app.query_one("#losses", LossPanel))
+        assert "total" in text
+        assert app.is_running
+
+
+@pytest.mark.anyio
+async def test_a_panel_that_raises_does_not_kill_the_app():
+    """Any render failure, not only NaN, has to stay contained."""
+    app = _app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await app.on_training_metrics(_payload())
+        await pilot.pause()
+
+        panel = app.query_one("#losses", LossPanel)
+        # render_panel, not _render: Textual owns _render as internal API.
+        panel.render_panel = lambda: 1 / 0
+
+        assert "render failed" in _text_of(panel)
+        assert app.is_running
+
+
+@pytest.mark.anyio
+async def test_an_unusable_payload_is_discarded_not_fatal():
+    app = _app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        broken = _payload()
+        # A KDA key the parser cannot split into a block index and a stat.
+        broken.losses["KDA/blockX"] = 1.0
+        await app.on_training_metrics(broken)
+        await pilot.pause()
+        assert app.is_running
+
+
 @pytest.mark.anyio
 async def test_loss_panel_shows_the_configured_losses():
     app = _app()

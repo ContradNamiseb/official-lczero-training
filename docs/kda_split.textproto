@@ -47,11 +47,14 @@ data_loader {
       # then discards the sources it never reached -- oldest first, with no
       # error.
       #
-      # 1,760,000 for the 175-tar set (174 cleanvisits + k2hyb-0000), which
-      # is 1,750,000 chunks: the value the 34,000-step run used. Restore to
-      # 3,600,000 when the held-back k2hyb tars go back, or the margin is
-      # one tar and older data starts vanishing silently.
-      chunk_pool_size: 1760000
+      # 3,600,000 covers the full 345-tar corpus (~3,445,000 chunks) with
+      # room for a few more drops. Drop it to 1,760,000 only while the
+      # corpus is cut back to the 175-tar set -- and never leave it below
+      # the tar count times 10,000, or the loop above silently trims.
+      #
+      # With --data-file-count this cap only has to exceed the window, so
+      # an oversized value stays correct there too.
+      chunk_pool_size: 3600000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {

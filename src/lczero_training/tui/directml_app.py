@@ -12,6 +12,8 @@ data, titles in the border, no nested frames. Panels never move.
 from __future__ import annotations
 
 import datetime
+import logging
+import math
 import subprocess
 import sys
 from collections import deque
@@ -33,8 +35,13 @@ from ..daemon.protocol.messages import (
 )
 from .log_pane import StreamingLogPane
 
+logger = logging.getLogger(__name__)
+
 _HISTORY = 60
 _SPARK = "▁▂▃▄▅▆▇█"
+# Drawn where a sample is not finite, so a NaN is visible as a gap rather
+# than silently plotted as the series minimum.
+_GAP = "·"
 
 # Health thresholds from docs/metrics.md. Colour is paired with the value
 # itself and a letter marker, never used alone.
@@ -45,22 +52,38 @@ _GATE_BAD = 0.30
 
 
 def _spark(values) -> str:
+    """A sparkline, with non-finite samples drawn as gaps.
+
+    NaN passes straight through min() and max() -- every comparison
+    against it is False -- so it survives unnoticed and only fails at
+    int(), which raises ValueError. Textual treats an exception in render
+    as fatal, and this app owns the training daemon, so one unplottable
+    number ends the run. That is not hypothetical: a single NaN in `total`
+    took down 4,250 steps of training.
+    """
     series = list(values)
     if len(series) < 2:
         return ""
-    low, high = min(series), max(series)
-    if high - low < 1e-12:
-        return _SPARK[0] * len(series)
+    finite = [v for v in series if math.isfinite(v)]
+    if not finite:
+        return _GAP * len(series)
+    low, high = min(finite), max(finite)
     span = high - low
-    return "".join(
-        _SPARK[min(int((v - low) / span * len(_SPARK)), len(_SPARK) - 1)]
-        for v in series
-    )
+    scale = len(_SPARK) - 1
+
+    def cell(value: float) -> str:
+        if not math.isfinite(value):
+            return _GAP
+        if span < 1e-12:
+            return _SPARK[0]
+        return _SPARK[max(0, min(int((value - low) / span * scale), scale))]
+
+    return "".join(cell(v) for v in series)
 
 
 def _trend(values) -> Text:
     """Direction of the last few samples, as an arrow plus colour."""
-    series = list(values)
+    series = [v for v in values if math.isfinite(v)]
     if len(series) < 6:
         return Text("  ")
     older = sum(series[-6:-3]) / 3.0
@@ -85,10 +108,38 @@ def _duration(seconds: float) -> str:
     return f"{minutes}m"
 
 
-class HeaderPanel(Static):
-    """Run identity, phase, and overall progress."""
+class DashboardPanel(Static):
+    """A panel whose rendering cannot take the training run down with it.
+
+    Textual treats an exception from render() as fatal, and this app owns
+    the daemon as a child process, so a display failure kills training.
+    One NaN in a sparkline did exactly that. A monitor is allowed to show
+    nothing; it is not allowed to stop the thing it is monitoring.
+
+    Subclasses implement render_panel(); a failure is logged and shown in
+    place of the panel's contents.
+
+    The hook is NOT called _render: Textual's Widget already defines that
+    as internal API returning a Visual, and overriding it with something
+    that returns a Rich renderable breaks layout with a confusing
+    "'Text' object has no attribute 'get_height'".
+    """
 
     def render(self):
+        try:
+            return self.render_panel()
+        except Exception:  # noqa: BLE001 - never kill a run for a display
+            logger.exception("Panel %s failed to render", type(self).__name__)
+            return Text("render failed - see the log", style="red")
+
+    def render_panel(self):  # pragma: no cover - subclasses override this
+        raise NotImplementedError
+
+
+class HeaderPanel(DashboardPanel):
+    """Run identity, phase, and overall progress."""
+
+    def render_panel(self):
         payload: Optional[TrainingMetricsPayload] = getattr(
             self, "payload", None
         )
@@ -126,10 +177,10 @@ class HeaderPanel(Static):
         return line
 
 
-class LossPanel(Static):
+class LossPanel(DashboardPanel):
     """The optimized losses, with sparklines and trend arrows."""
 
-    def render(self):
+    def render_panel(self):
         history = getattr(self, "history", {})
         if not history:
             return Text("waiting for the first step...", style="dim")
@@ -160,10 +211,10 @@ class LossPanel(Static):
         return table
 
 
-class KdaPanel(Static):
+class KdaPanel(DashboardPanel):
     """Per-block KDA gate health. See docs/metrics.md."""
 
-    def render(self):
+    def render_panel(self):
         blocks = getattr(self, "blocks", {})
         if not blocks:
             return Text("no KDA metrics yet", style="dim")
@@ -219,10 +270,10 @@ class KdaPanel(Static):
         return table
 
 
-class PolicyPanel(Static):
+class PolicyPanel(DashboardPanel):
     """Move-ranking quality, which the policy loss alone does not show."""
 
-    def render(self):
+    def render_panel(self):
         scalars = getattr(self, "scalars", {})
         if not scalars:
             return Text("--", style="dim")
@@ -254,14 +305,14 @@ class PolicyPanel(Static):
         return table
 
 
-class OptimizerPanel(Static):
+class OptimizerPanel(DashboardPanel):
     """Gradient norm against the clip, learning rate, throughput."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.max_grad_norm = 10.0
 
-    def render(self):
+    def render_panel(self):
         scalars = getattr(self, "scalars", {})
         if not scalars:
             return Text("--", style="dim")
@@ -429,6 +480,12 @@ class DirectMlTuiApp(App):
     async def on_training_metrics(
         self, payload: TrainingMetricsPayload
     ) -> None:
+        try:
+            self._ingest_metrics(payload)
+        except Exception:  # noqa: BLE001 - a bad payload must not stop a run
+            logger.exception("Discarding an unusable metrics payload")
+
+    def _ingest_metrics(self, payload: TrainingMetricsPayload) -> None:
         self._last = payload
         losses = payload.losses or {}
 
@@ -439,6 +496,17 @@ class DirectMlTuiApp(App):
                 self._blocks.setdefault(index, {})[stat] = value
                 continue
             self._scalars[name] = value
+            # Kept in the history so the sparkline shows it as a gap rather
+            # than hiding it, but worth a log line: a NaN in a loss is a
+            # training event, and the trainer's own log only records every
+            # --log-every steps, so it can miss one entirely.
+            if not math.isfinite(value):
+                logger.warning(
+                    "Non-finite metric from the daemon at step %d: %s=%r",
+                    payload.step,
+                    name,
+                    value,
+                )
             self._history.setdefault(name, deque(maxlen=_HISTORY)).append(value)
         for key in ("grad_norm", "lr", "ms_per_step"):
             value = getattr(
