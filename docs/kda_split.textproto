@@ -251,6 +251,22 @@ training {
   # free at rest, so headroom is thin. Raise it once a run has been stable
   # for a few thousand steps -- the effective batch is this times
   # tensor_generator.batch_size.
+  #
+  # Do NOT set this to 1 on DirectML. Peak *activation* memory really is
+  # accumulation-neutral, but peak process memory is not, and the difference
+  # decides whether a run lives:
+  #
+  #   accumulation 4: RSS plateaus at 4.63 GB and the run continues
+  #   accumulation 1: RSS passes 5.9 GB inside 90 s and the run dies
+  #
+  # Measured three times over, each launch starting with 5.6-5.7 GB free --
+  # so this is not other processes competing, and closing things does not
+  # help. The mechanism is churn, not peak: NAdamW's update allocates about
+  # ten short-lived temporaries per parameter, DirectML strands a heap for
+  # many of them, and accumulation is the one lever that runs optimizer.step()
+  # LESS often per unit of data. At 1 it runs 4x as often and the stranding
+  # outruns the headroom. Fixing the optimizer to reuse buffers would remove
+  # the constraint; until then 4 is load-bearing.
   gradient_accumulation_steps: 4
 }
 model {

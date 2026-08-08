@@ -47,7 +47,7 @@ class DirectMlTrainingDaemon:
         eval_every: int = 0,
         eval_batches: int = 50,
         eval_device: Optional[str] = None,
-        eval_timeout: float = 900.0,
+        eval_timeout: float = 300.0,
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
         gc_every: int = 0,
@@ -155,10 +155,18 @@ class DirectMlTrainingDaemon:
         # that function, so referencing them from this method would raise
         # NameError at precisely the moment the checkpoint matters.
         from lczero_training.directml import checkpoint as checkpoint_io
+        from lczero_training.directml import host_memory
         from lczero_training.directml.training import (
             make_checkpoint,
             release_to_host,
         )
+
+        # First, before the collection and the host transfer below change it.
+        # Every DirectML failure reports the same sentence and nothing about
+        # the machine, which is why each OOM so far has been diagnosed by
+        # inference: "the allocator stranded its heaps" and "something else
+        # was resident" produce identical logs and need opposite fixes.
+        logger.error("Memory at the failure: %s", host_memory.snapshot())
 
         if error.__traceback__ is not None:
             traceback.clear_frames(error.__traceback__)
@@ -415,6 +423,17 @@ class DirectMlTrainingDaemon:
                 ),
             )
             return 1
+
+        # The baseline every later reading is compared against. A launch that
+        # starts with under a gigabyte spare is one that will die in its first
+        # few steps, and saying so here beats inferring it from the wreckage:
+        # the trainer needs ~3.8 GB of its own before the loader's 1.6 GB.
+        from lczero_training.directml import host_memory
+
+        logger.info(
+            "Memory before the loader starts: %s", host_memory.snapshot()
+        )
+        host_memory.warn_if_low("before training")
 
         self._emit(
             phase=TrainingPhase.LOADING_DATA.value,

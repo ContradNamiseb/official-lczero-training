@@ -19,6 +19,7 @@ from proto.root_config_pb2 import RootConfig
 
 from . import checkpoint as checkpoint_io
 from . import derived_metrics
+from . import host_memory
 from .losses import LczeroLoss, materialize_metrics
 from .lr_schedule import make_lr_schedule
 from .metrics import Reporter
@@ -315,6 +316,14 @@ def train(
             scalars["lr"] = learning_rate
             elapsed_so_far = time.perf_counter() - started
             scalars["ms_per_step"] = elapsed_so_far / (index + 1) * 1000.0
+            # Charted alongside the losses on purpose. Whether a run died
+            # because the machine filled up or because the allocator stranded
+            # its heaps is the question every OOM here has turned on, and a
+            # trace that either falls steadily or sits flat until it drops
+            # answers it at a glance.
+            available = host_memory.available_gb()
+            if available is not None:
+                scalars["mem_available_gb"] = available
 
             for reporter in reporters if should_report else ():
                 try:
@@ -328,14 +337,19 @@ def train(
             detail = "  ".join(
                 f"{name}={value:.4f}"
                 for name, value in sorted(scalars.items())
-                if name not in ("grad_norm", "lr", "ms_per_step")
+                if name
+                not in ("grad_norm", "lr", "ms_per_step", "mem_available_gb")
             )
             logger.info(
-                "step %d  %s  grad_norm=%.4f  lr=%.3g",
+                "step %d  %s  grad_norm=%.4f  lr=%.3g  mem[%s]",
                 step,
                 detail,
                 float(grad_norm),
                 learning_rate,
+                # On the log line rather than in the metrics: this describes
+                # the machine, not the model, and it is the number every
+                # out-of-memory post-mortem here has had to guess at.
+                host_memory.snapshot(),
             )
 
         # Everything the step still owns, dropped before the next forward
@@ -347,6 +361,13 @@ def train(
         del metrics, grad_norm, batch
         if should_log or should_report:
             del scalars
+
+        # Every step, not on the logging cadence. log_every is a quarter of a
+        # checkpoint interval -- 250 steps -- and the launches this exists to
+        # explain died at steps 7, 9 and 27, so a warning gated on the log
+        # line would never have fired once. Reading one psutil counter is
+        # nothing against a ~900 ms step.
+        host_memory.warn_if_low(f"step {step}")
 
         if gc_every and step % gc_every == 0:
             # Reference counting frees a tensor the moment its last Python
@@ -429,6 +450,12 @@ def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
     device mismatch waiting for the next thing that touches the pair.
     """
     model.zero_grad(set_to_none=True)
+    # Same argument as the gradients: the optimizer's scratch buffers are
+    # ~48 MB of device memory that no checkpoint wants, and dropping them
+    # costs no allocation. Rebuilt on the next step, which for this caller
+    # never comes.
+    if optimizer is not None and hasattr(optimizer, "free_scratch"):
+        optimizer.free_scratch()
 
     moved = 0
     # keep_vars=True yields the Parameters and buffers themselves rather

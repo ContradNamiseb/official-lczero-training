@@ -95,6 +95,163 @@ def test_nadamw_matches_optax(weight_decay, start_step):
     )
 
 
+def _nadamw_step_by_expressions(
+    params,
+    grads,
+    state,
+    *,
+    beta1,
+    beta2,
+    eps,
+    eps_root,
+    lr,
+    weight_decay,
+):
+    """NAdamW.step exactly as it was written before the buffer rewrite.
+
+    The oracle for ``test_nadamw_is_bit_exact_after_the_buffer_rewrite``.
+    Every line here allocated a fresh tensor -- which is what the rewrite
+    removed and what this must go on proving it did not change. Do not
+    "tidy" this: its value is being a frozen copy, so reordering an
+    operation here to look nicer would destroy the comparison.
+    """
+    for param, grad in zip(params, grads):
+        # Not setdefault: it evaluates its default eagerly, so every step
+        # would build two throwaway zeros_like tensors and any allocation
+        # count taken through this helper would be two per parameter high.
+        if id(param) not in state:
+            state[id(param)] = {
+                "step": 0,
+                "mu": torch.zeros_like(param),
+                "nu": torch.zeros_like(param),
+            }
+        entry = state[id(param)]
+        mu, nu = entry["mu"], entry["nu"]
+        mu.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        nu.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+        count = entry["step"] + 1
+        entry["step"] = count
+
+        mu_hat = mu / (1.0 - beta1 ** (count + 1))
+        grad_hat = grad / (1.0 - beta1**count)
+        blended = beta1 * mu_hat + (1.0 - beta1) * grad_hat
+        nu_hat = nu / (1.0 - beta2**count)
+
+        update = blended / (torch.sqrt(nu_hat + eps_root) + eps)
+        if weight_decay != 0.0:
+            update = update + weight_decay * param
+        param.add_(update, alpha=-lr)
+
+
+@pytest.mark.parametrize("weight_decay", [0.0, 1e-4])
+@pytest.mark.parametrize("start_step", [0, 97000])
+def test_nadamw_is_bit_exact_after_the_buffer_rewrite(weight_decay, start_step):
+    """The rewrite removed ~10 allocations per parameter per step. It must
+    not have moved a single bit of the result.
+
+    ``test_nadamw_matches_optax`` above only holds this to rtol=1e-5, which
+    is the right tolerance for a cross-framework comparison and far too
+    loose for a refactor: a reassociated multiply would pass it while
+    quietly changing the trajectory of a network 195,000 steps in. So this
+    compares against a frozen copy of the old expressions and demands
+    equality to the bit.
+
+    Several shapes and several steps, because the bias corrections change
+    every step and a 1-D parameter exercises different kernels from a 2-D one.
+    """
+    beta1, beta2, eps, eps_root, lr = 0.9, 0.98, 1e-7, 0.0, 1e-4
+    rng = np.random.default_rng(7)
+    shapes = [(6, 5), (17,), (3, 4, 4)]
+    initial = [rng.normal(size=s).astype(np.float32) for s in shapes]
+    grads = [
+        [rng.normal(size=s).astype(np.float32) for s in shapes]
+        for _ in range(6)
+    ]
+
+    ours = [torch.nn.Parameter(torch.from_numpy(a.copy())) for a in initial]
+    optimizer = NAdamW(
+        ours,
+        lr=lr,
+        betas=(beta1, beta2),
+        eps=eps,
+        weight_decay=weight_decay,
+        eps_root=eps_root,
+    )
+    if start_step:
+        optimizer.set_step(start_step)
+
+    reference = [torch.from_numpy(a.copy()) for a in initial]
+    reference_state: dict = {}
+    if start_step:
+        for param in reference:
+            reference_state[id(param)] = {
+                "step": start_step,
+                "mu": torch.zeros_like(param),
+                "nu": torch.zeros_like(param),
+            }
+
+    for step_grads in grads:
+        optimizer.zero_grad()
+        for param, grad in zip(ours, step_grads):
+            param.grad = torch.from_numpy(grad.copy())
+        optimizer.step()
+        _nadamw_step_by_expressions(
+            reference,
+            [torch.from_numpy(g.copy()) for g in step_grads],
+            reference_state,
+            beta1=beta1,
+            beta2=beta2,
+            eps=eps,
+            eps_root=eps_root,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+    for index, (mine, theirs) in enumerate(zip(ours, reference)):
+        assert torch.equal(mine.detach(), theirs), (
+            f"parameter {index} of shape {shapes[index]} diverged from the "
+            f"pre-rewrite implementation; max |delta| "
+            f"{(mine.detach() - theirs).abs().max().item():.3e}"
+        )
+
+
+def test_nadamw_reuses_its_scratch_buffers_across_steps():
+    """The point of the rewrite. If a future edit reintroduces expression
+    temporaries this stays green, so it checks the mechanism instead: the
+    buffers exist, there are exactly two per parameter, and step() does not
+    allocate new ones."""
+    param = torch.nn.Parameter(torch.zeros(4, 4))
+    optimizer = NAdamW([param], lr=1e-4)
+
+    param.grad = torch.ones(4, 4)
+    optimizer.step()
+    first = optimizer._scratch[param]
+    assert len(first) == 2
+
+    param.grad = torch.ones(4, 4)
+    optimizer.step()
+    assert optimizer._scratch[param] is first, "buffers were reallocated"
+    assert all(a is b for a, b in zip(optimizer._scratch[param], first))
+
+    # And they are droppable, which is what the emergency checkpoint needs.
+    optimizer.free_scratch()
+    assert param not in optimizer._scratch
+
+
+def test_scratch_buffers_stay_out_of_the_checkpoint():
+    """They are ~48 MB of uninitialized memory for this model. In state_dict
+    they would bloat every checkpoint and change its format."""
+    param = torch.nn.Parameter(torch.zeros(8, 8))
+    optimizer = NAdamW([param], lr=1e-4)
+    param.grad = torch.ones(8, 8)
+    optimizer.step()
+
+    packed = optimizer.state_dict()
+    keys = {key for entry in packed["state"].values() for key in entry}
+
+    assert keys == {"step", "mu", "nu"}, f"unexpected checkpoint keys: {keys}"
+
+
 def test_nadamw_differs_from_torch_nadam():
     """Guard the reason this optimizer exists at all.
 

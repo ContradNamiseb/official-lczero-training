@@ -79,6 +79,37 @@ class NAdamW(torch.optim.Optimizer):
             eps_root=eps_root,
         )
         super().__init__(params, defaults)
+        # Deliberately NOT in self.state: that is what state_dict() packs, and
+        # putting scratch there would add ~48 MB of uninitialized buffers to
+        # every checkpoint and change its format. Rebuilt lazily after a load.
+        self._scratch: dict[
+            torch.Tensor, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def _scratch_for(
+        self, param: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Two reusable buffers shaped like ``param``.
+
+        Two, not one, and not ``param.grad`` reused as the second. Borrowing
+        the gradient would save 24 MB and silently destroy it inside step(),
+        which nothing reads today and something eventually would.
+        """
+        buffers = self._scratch.get(param)
+        if buffers is None:
+            # empty_like is safe: the first write to each is an `out=` that
+            # covers every element.
+            buffers = (torch.empty_like(param), torch.empty_like(param))
+            self._scratch[param] = buffers
+        return buffers
+
+    def free_scratch(self) -> None:
+        """Drop the scratch buffers, rebuilt on the next step.
+
+        For the emergency checkpoint path, where every megabyte the device
+        gives back is one the save no longer has to find.
+        """
+        self._scratch.clear()
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -110,19 +141,51 @@ class NAdamW(torch.optim.Optimizer):
                 count = state["step"] + 1
                 state["step"] = count
 
+                # Every line below used to allocate. Written as expressions --
+                # mu_hat, grad_hat, blended, nu_hat, update -- this loop asked
+                # DirectML for a measured 12 tensors per parameter per step
+                # (now 0, counted through TorchDispatchMode), so a
+                # ~200-parameter model made ~2,400 allocations per optimizer
+                # step. DirectML suballocates from coarse heaps and a heap
+                # stays live until everything in it is freed, so that churn
+                # became retained memory: at gradient_accumulation_steps 1,
+                # which runs this 4x as often per unit of data, the process
+                # passed 5.9 GB within 90 seconds and died, where 4 plateaued
+                # at 4.63 GB and ran on.
+                #
+                # So the arithmetic is unchanged and the results go into two
+                # borrowed buffers instead. The operation ORDER is unchanged
+                # too, deliberately: `mu * (beta1 / bc)` is not bit-identical
+                # to `beta1 * (mu / bc)`, and this optimizer exists to
+                # reproduce Optax exactly. test_nadamw_is_bit_exact_after_the
+                # _buffer_rewrite pins that against the old expressions.
+                update, scratch = self._scratch_for(param)
+
                 # Optax's nesterov branch: the first moment is bias-corrected
                 # one step ahead, and blended with the bias-corrected raw
                 # gradient. This is the part torch.optim.NAdam does not do.
-                mu_hat = mu / (1.0 - beta1 ** (count + 1))
-                grad_hat = grad / (1.0 - beta1**count)
-                blended = beta1 * mu_hat + (1.0 - beta1) * grad_hat
-                nu_hat = nu / (1.0 - beta2**count)
+                #   blended = beta1 * mu_hat + (1 - beta1) * grad_hat
+                torch.div(mu, 1.0 - beta1 ** (count + 1), out=update)
+                update.mul_(beta1)
+                torch.div(grad, 1.0 - beta1**count, out=scratch)
+                scratch.mul_(1.0 - beta1)
+                update.add_(scratch)
 
-                update = blended / (torch.sqrt(nu_hat + eps_root) + eps)
+                #   update = blended / (sqrt(nu_hat + eps_root) + eps)
+                torch.div(nu, 1.0 - beta2**count, out=scratch)
+                scratch.add_(eps_root)
+                scratch.sqrt_()
+                scratch.add_(eps)
+                update.div_(scratch)
+
                 if weight_decay != 0.0:
                     # Decoupled: added to the update, not to the gradient, so
-                    # it is not scaled by the adaptive denominator.
-                    update = update + weight_decay * param
+                    # it is not scaled by the adaptive denominator. Built as
+                    # `weight_decay * param` then added, rather than
+                    # add_(param, alpha=...), which may fuse the multiply and
+                    # round differently.
+                    torch.mul(param, weight_decay, out=scratch)
+                    update.add_(scratch)
                 param.add_(update, alpha=-lr)
 
         return loss
