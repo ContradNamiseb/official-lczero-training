@@ -83,10 +83,17 @@ def pad_last(tensor: torch.Tensor, width: int) -> torch.Tensor:
 
     A zero-width ``torch.nn.functional.pad`` produces incorrect KDA results
     at chunk boundaries, so the call has to be elided rather than issued
-    with a no-op width.
+    with a no-op width. Eliding returns the tensor as-is, and the KDA row
+    loops feed it a ragged ``sum`` output that is still a view over the
+    preceding elementwise product. Chaining further ops off an alias like
+    that leaves the DirectML allocator unable to reclaim the underlying
+    block until every view of it is dead, which shows up as a training OOM
+    long after the row loop itself. ``contiguous()`` is a no-op on an
+    already-contiguous tensor, so this costs nothing outside the ragged
+    last row.
     """
     if width == 0:
-        return tensor
+        return tensor.contiguous()
     return torch.nn.functional.pad(tensor, (0, width))
 
 

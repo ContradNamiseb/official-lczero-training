@@ -7,6 +7,7 @@ natively-built C++ data loader -- no WSL, no localhost protocol.
 from __future__ import annotations
 
 import dataclasses
+import gc
 import logging
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -176,6 +177,7 @@ def train(
     diagnostics: bool = True,
     eval_hook: "Callable[[int], None] | None" = None,
     eval_every: int = 0,
+    gc_every: int = 0,
 ) -> int:
     """Run `steps` optimizer steps. Returns the resulting global step.
 
@@ -329,6 +331,35 @@ def train(
                 float(grad_norm),
                 learning_rate,
             )
+
+        # Everything the step still owns, dropped before the next forward
+        # allocates. `predictions` went above; these are the rest. Without
+        # this they stay referenced through the following step's forward
+        # and backward, so the run carries one extra step's tensors at all
+        # times -- and on DirectML a referenced block is one the allocator
+        # will not reuse.
+        del metrics, grad_norm, batch
+        if should_log or should_report:
+            del scalars
+
+        if gc_every and step % gc_every == 0:
+            # Reference counting frees a tensor the moment its last Python
+            # reference dies, so this is only for what cycles hold: autograd
+            # nodes and any exception context that outlived its frame.
+            # Python's own collector runs on allocation-count heuristics
+            # that a training loop can starve for a long time.
+            #
+            # This does NOT flush a device cache. torch_directml exposes no
+            # empty_cache, no memory_allocated, and no synchronize (checked
+            # against 0.2.5.dev240914), and torch._C._host_emptyCache does
+            # not exist -- so nothing in this process can hand blocks back
+            # to the DirectML allocator. All this can do is make sure Python
+            # is not the one holding them.
+            collected = gc.collect()
+            if collected:
+                logger.debug(
+                    "gc at step %d freed %d object(s)", step, collected
+                )
 
         # Evaluation runs after the step, so the reported test metrics
         # correspond to the weights the matching train metrics describe.

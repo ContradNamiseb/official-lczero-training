@@ -46,6 +46,9 @@ class DirectMlTrainingDaemon:
         output: Optional[str] = None,
         eval_every: int = 0,
         eval_batches: int = 50,
+        data_file_count: Optional[int] = None,
+        data_phase_step_interval: Optional[int] = None,
+        gc_every: int = 0,
     ):
         self._config_filepath = config_filepath
         self._checkpoint_dir = checkpoint_dir
@@ -58,6 +61,9 @@ class DirectMlTrainingDaemon:
         self._output = output
         self._eval_every = eval_every
         self._eval_batches = eval_batches
+        self._data_file_count = data_file_count
+        self._data_phase_step_interval = data_phase_step_interval
+        self._gc_every = gc_every
 
         self._extra_reporters: list = []
         self._stop = threading.Event()
@@ -153,6 +159,52 @@ class DirectMlTrainingDaemon:
                 "progress since the last checkpoint is lost",
                 step,
             )
+
+    def _apply_data_phasing(self, config, step: int) -> None:
+        """Restrict the corpus to the current phase's tars via a farm.
+
+        Rewrites the file_path_provider's directory in ``config`` to a
+        symlink farm holding only the tar window that owns ``step``. The
+        farm lives in a temp dir so the real corpus is never touched. The
+        provider's watcher then indexes only that window, which is what
+        keeps the resident chunk-pool metadata -- and so the peak memory
+        the DirectML allocator must carve from -- small on a long run.
+        """
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        from lczero_training.directml import data_phasing
+
+        source_dir = config.data_loader.stage[0].file_path_provider.directory
+        interval = (
+            self._data_phase_step_interval
+            or data_phasing.DEFAULT_PHASE_STEP_INTERVAL
+        )
+        window = data_phasing.phase_window(
+            directory=Path(source_dir),
+            file_count=self._data_file_count,
+            phase_step_interval=interval,
+            step=step,
+        )
+        # A stable path, not tempfile.mkdtemp(): the farm is rebuilt from
+        # scratch on every start, so a fresh directory each time would
+        # accumulate one per run forever -- and when the link fallbacks
+        # degrade to copying, each of those is the size of the window.
+        # Derived from the source directory so two corpora do not collide.
+        digest = hashlib.sha256(source_dir.encode("utf-8")).hexdigest()[:12]
+        farm_dir = Path(tempfile.gettempdir()) / f"lc0-data-phase-{digest}"
+        stats = data_phasing.build_phase_farm(farm_dir=farm_dir, window=window)
+        config.data_loader.stage[0].file_path_provider.directory = str(farm_dir)
+        logger.info(
+            "file_path_provider now reads the phase farm %s (%d tars: "
+            "%d symlinked, %d hardlinked, %d copied)",
+            farm_dir,
+            len(window),
+            stats.symlinked,
+            stats.hardlinked,
+            stats.copied,
+        )
 
     def _make_eval_hook(
         self, config, model, device, loader, has_split: bool, device_name: str
@@ -260,6 +312,14 @@ class DirectMlTrainingDaemon:
             )
             return 1
 
+        # Phase the visible corpus down to a window of tars before the
+        # loader indexes anything. The resident pool metadata scales with
+        # the number of tars it can see; on the Iris Xe's shared memory
+        # that growth is what eventually OOMs a long run, so the loader is
+        # pointed at a symlink farm exposing only the current phase's tars.
+        if self._data_file_count is not None:
+            self._apply_data_phasing(config, restored.step)
+
         if self._kda_chunk_size:
             config.model.encoder.kda.chunk_size = self._kda_chunk_size
         if self._grad_accum:
@@ -365,6 +425,7 @@ class DirectMlTrainingDaemon:
                     report_every=self._report_every,
                     eval_hook=eval_hook,
                     eval_every=self._eval_every,
+                    gc_every=self._gc_every,
                 )
                 self._emit(
                     phase=TrainingPhase.SAVING.value,

@@ -30,10 +30,10 @@ data_loader {
       }
       output {
         name: "test"
-        queue_capacity: 16
+        queue_capacity: 1
       }
-      weight: 95
-      weight: 5
+      weight: 99
+      weight: 1
     }
   }
   stage {
@@ -42,11 +42,16 @@ data_loader {
     shuffling_chunk_pool {
       # Sampling WINDOW, not a buffer: the pool draws from the last
       # chunk_pool_size chunks it has seen, so anything smaller than the
-      # corpus silently trains on a slice of it. 346 tars x 10,000 chunks
-      # = 3,460,000; kept a little above that so newly dropped tars are
-      # covered without another edit. Costs bookkeeping only -- chunk data
-      # is read on demand.
-      chunk_pool_size: 3600000
+      # corpus silently trains on a slice of it. It must also stay ABOVE
+      # the total, because the indexing loop breaks once it has enough and
+      # then discards the sources it never reached -- oldest first, with no
+      # error.
+      #
+      # 1,760,000 for the 175-tar set (174 cleanvisits + k2hyb-0000), which
+      # is 1,750,000 chunks: the value the 34,000-step run used. Restore to
+      # 3,600,000 when the held-back k2hyb tars go back, or the margin is
+      # one tar and older data starts vanishing silently.
+      chunk_pool_size: 1760000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {
@@ -243,7 +248,7 @@ training {
   # free at rest, so headroom is thin. Raise it once a run has been stable
   # for a few thousand steps -- the effective batch is this times
   # tensor_generator.batch_size.
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
 }
 model {
   defaults {

@@ -55,6 +55,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--report-every", type=int, default=5)
     parser.add_argument(
+        "--data-file-count",
+        type=int,
+        help=(
+            "Limit the visible corpus to this many tar files per phase. "
+            "Keeps the chunk-pool metadata -- and the DirectML allocator's "
+            "peak -- small on long runs. Off when unset."
+        ),
+    )
+    parser.add_argument(
+        "--data-phase-step-interval",
+        type=int,
+        help=(
+            "Steps per data phase; the tar window advances every this many "
+            "steps. Defaults to 250000 when --data-file-count is set."
+        ),
+    )
+    parser.add_argument(
+        "--gc-every",
+        type=int,
+        default=500,
+        help=(
+            "Force a Python garbage collection every N optimizer steps. "
+            "Frees tensors that reference cycles still hold; it cannot "
+            "flush the DirectML allocator, which exposes no such API. 0 "
+            "disables."
+        ),
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=0,
@@ -92,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
+        data_file_count=args.data_file_count,
+        data_phase_step_interval=args.data_phase_step_interval,
+        gc_every=args.gc_every,
     )
     return daemon.run()
 

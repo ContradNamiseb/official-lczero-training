@@ -371,6 +371,131 @@ def _grads_after_one_step(config, batches):
     }
 
 
+def test_step_releases_its_tensors_before_the_next_one():
+    """Nothing from a finished step may still be referenced.
+
+    `metrics`, `grad_norm` and `batch` stayed bound until the next
+    iteration reassigned them, so the loop carried an extra step's tensors
+    at all times. On DirectML a referenced block is one the allocator will
+    not reuse, which is the shape of a slow creep to OOM over thousands of
+    steps.
+
+    Watches the first batch by weak reference: if the loop still holds it
+    two steps later, it stays alive here too.
+    """
+    import gc
+    import weakref
+
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.training import train
+
+    config = _tiny_training_config()
+    torch.manual_seed(1234)
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+
+    batches = _fixed_batches(3, 4, seed=5)
+    watched = weakref.ref(batches[0].inputs)
+
+    def draining():
+        # Pops as it yields, so the list stops holding a batch the moment
+        # the loop takes it. Anything still alive afterwards is the loop's.
+        while batches:
+            yield batches.pop(0)
+
+    train(
+        config=config,
+        model=model,
+        optimizer=optimizer,
+        batches=draining(),
+        device=torch.device("cpu"),
+        start_step=0,
+        steps=3,
+        log_every=0,
+        diagnostics=False,
+    )
+    gc.collect()
+
+    assert watched() is None, (
+        "the first step's batch is still referenced after later steps"
+    )
+
+
+def test_gc_every_runs_a_collection_on_schedule():
+    """The hook must fire, and only on the configured cadence."""
+    import lczero_training.directml.training as training_module
+    from lczero_training.directml.model import LczeroModel
+
+    config = _tiny_training_config()
+    torch.manual_seed(1234)
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+
+    calls: list[int] = []
+    original = training_module.gc.collect
+
+    def counting_collect(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    training_module.gc.collect = counting_collect
+    try:
+        training_module.train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=iter(_fixed_batches(6, 4, seed=6)),
+            device=torch.device("cpu"),
+            start_step=0,
+            steps=6,
+            log_every=0,
+            diagnostics=False,
+            gc_every=2,
+        )
+    finally:
+        training_module.gc.collect = original
+
+    # Steps 1..6 collecting when step % 2 == 0 -> steps 2, 4 and 6.
+    assert len(calls) == 3, f"expected 3 collections, got {len(calls)}"
+
+
+def test_gc_every_zero_never_collects():
+    import lczero_training.directml.training as training_module
+    from lczero_training.directml.model import LczeroModel
+
+    config = _tiny_training_config()
+    torch.manual_seed(1234)
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+
+    calls: list[int] = []
+    original = training_module.gc.collect
+    training_module.gc.collect = lambda *a, **k: (calls.append(1), 0)[1]
+    try:
+        training_module.train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=iter(_fixed_batches(3, 4, seed=7)),
+            device=torch.device("cpu"),
+            start_step=0,
+            steps=3,
+            log_every=0,
+            diagnostics=False,
+            gc_every=0,
+        )
+    finally:
+        training_module.gc.collect = original
+
+    assert calls == []
+
+
 def test_accumulated_gradient_matches_the_whole_batch():
     """Four micro-batches of 8 must equal one batch of 32.
 
