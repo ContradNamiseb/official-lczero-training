@@ -241,7 +241,7 @@ training {
       weight: 1.0
     }
   }
-  max_grad_norm: 10.0
+  max_grad_norm: 16.0
   # Batch 32 is the hard memory ceiling for this model on the Iris Xe (48
   # already OOMs), so the effective batch is bought with accumulation
   # instead, at the peak memory of a single 32.
@@ -251,7 +251,7 @@ training {
   # free at rest, so headroom is thin. Raise it once a run has been stable
   # for a few thousand steps -- the effective batch is this times
   # tensor_generator.batch_size.
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
 }
 model {
   defaults {

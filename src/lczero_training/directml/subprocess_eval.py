@@ -26,6 +26,13 @@ What this does *not* remove is the test data pipeline. It stays resident in
 the trainer, because it is the thing producing the batches, and its cost is
 host memory in the C++ loader rather than device blocks that strand a heap.
 
+The worker runs on the **CPU** by default. That is not a fallback: a worker
+building a second DX12 context beside a trainer holding 3.8 GB of the same
+shared memory failed to finish importing inside 900 seconds, while the same
+50 batches take 15 seconds on the CPU -- 5 of them being ``import torch``.
+Fifty forward passes at batch 32 do not need a GPU, and wanting one here
+means contending for the exact resource the run is short of.
+
 A failed or hung worker is logged and skipped. Evaluation is observational,
 and no measurement is worth ending a training run over.
 """
@@ -51,10 +58,14 @@ CONFIG_FILE = "config.textproto"
 WEIGHTS_FILE = "weights.pt"
 BATCHES_FILE = "batches.npz"
 RESULT_FILE = "scalars.json"
+# The worker's own log, which it writes before it can hang. Read back here on
+# failure, because a killed worker's stderr may never have reached us.
+WORKER_LOG_FILE = "worker.log"
 
-# Generous: a worker pushed onto the CPU with --eval-device cpu is minutes
-# rather than seconds, and killing a slow eval costs the measurement.
-DEFAULT_TIMEOUT_SECONDS = 900.0
+# The trainer is paused for every second of this, so it is a ceiling on the
+# damage one stuck eval can do rather than a generous allowance. Measured: 50
+# batches on the CPU take 15 s end to end, imports included.
+DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
 def work_directory(config_filepath: str) -> pathlib.Path:
@@ -153,6 +164,8 @@ def make_eval_hook(
         WORKER_MODULE,
         "--work-dir",
         str(directory),
+        "--log-file",
+        str(directory / WORKER_LOG_FILE),
     ]
     if device_spec:
         command += ["--device", device_spec]
@@ -195,20 +208,43 @@ def make_eval_hook(
             )
         return json.loads(result_path.read_text())
 
+    def worker_tail(lines: int = 8) -> str:
+        """The last of the worker's own log, for a failure message.
+
+        The worker may die without reaching our stderr at all -- that is how
+        the first stall left no evidence anywhere -- so its log on disk is
+        what says which stage it was in.
+        """
+        try:
+            recorded = (
+                (directory / WORKER_LOG_FILE)
+                .read_text(encoding="utf-8", errors="replace")
+                .splitlines()
+            )
+        except OSError:
+            return "the worker left no log"
+        if not recorded:
+            return "the worker's log is empty; it died before its first stage"
+        return "\n".join(recorded[-lines:])
+
     def hook(step: int) -> None:
         try:
             scalars = run(step)
         except subprocess.TimeoutExpired:
             logger.error(
                 "Evaluation at step %d timed out after %.0fs and was killed; "
-                "training continues",
+                "training continues. The worker got this far:\n%s",
                 step,
                 timeout,
+                worker_tail(),
             )
             return
         except Exception:  # noqa: BLE001 - a measurement cannot end a run
             logger.exception(
-                "Evaluation at step %d failed; training continues", step
+                "Evaluation at step %d failed; training continues. The worker "
+                "got this far:\n%s",
+                step,
+                worker_tail(),
             )
             return
         if scalars and on_scalars is not None:

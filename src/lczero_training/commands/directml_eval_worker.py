@@ -8,7 +8,16 @@ the batches arrive as a file rather than from a data loader here.
 
 Reads ``--work-dir`` for the config, the weights and the batches the trainer
 left; writes the TensorBoard ``-test`` run and ``scalars.json`` back into it.
-Logs to stderr, because the parent's stdout may be carrying the TUI protocol.
+
+**Nothing heavy may be imported at module scope here, and logging has to be
+configured before the first such import.** The first version of this file
+imported ``directml.device`` -- and so torch and torch_directml -- on line
+one, before ``basicConfig``. At step 195000 of a real run that import did not
+return inside the trainer's 900-second timeout, and because logging did not
+yet exist the worker was killed without emitting one byte: a fifteen-minute
+stall with no evidence in it at all. Every stage below therefore logs before
+it starts, to stderr *and* to ``worker.log`` in the work directory, so a
+worker that dies invisibly to its parent still leaves a record on disk.
 """
 
 import argparse
@@ -16,9 +25,7 @@ import json
 import logging
 import pathlib
 import sys
-
-# Before anything can touch the device.
-from lczero_training.directml import device as dml_device  # noqa: F401
+import time
 
 logger = logging.getLogger("lc0-directml-eval-worker")
 
@@ -44,24 +51,65 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--kda-chunk-size", type=int)
+    parser.add_argument(
+        "--log-file",
+        help=(
+            "Mirror this worker's log here as well as to stderr. The trainer "
+            "passes it and reads it back if the eval fails."
+        ),
+    )
     return parser
+
+
+def _configure_logging(log_file: str | None) -> None:
+    """stderr, plus a file if the parent asked for one, before anything heavy.
+
+    The file handler is the point. The parent redirects our stdout and may
+    itself be killed, or lose the stderr pipe with it; a log on disk survives
+    all of that and is where to look when an eval produces no scalars.
+    """
+    formatter = logging.Formatter(
+        "%(levelname).1s%(asctime)s.%(msecs)03d %(name)s "
+        "%(filename)s:%(lineno)d] %(message)s",
+        datefmt="%m%d %H:%M:%S",
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if log_file:
+        # Truncated per run: this is the record of the eval in progress, not
+        # a history, and the trainer reads it back on failure.
+        handlers.append(
+            logging.FileHandler(log_file, mode="w", encoding="utf-8")
+        )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(levelname).1s%(asctime)s.%(msecs)03d %(name)s "
-            "%(filename)s:%(lineno)d] %(message)s"
-        ),
-        datefmt="%m%d %H:%M:%S",
-        stream=sys.stderr,
+    work_dir = pathlib.Path(args.work_dir)
+    _configure_logging(args.log_file)
+    logger.info(
+        "Eval worker for step %d starting in %s on device %s",
+        args.step,
+        work_dir,
+        args.device or "the default",
     )
 
+    # Imported here, not at module scope, and only once logging exists. On a
+    # memory-starved machine `import torch` alone can take minutes, and
+    # importing torch_directml builds a second DX12 context alongside the
+    # trainer's; both used to happen before there was any way to say so.
+    started = time.perf_counter()
+    logger.info("Importing torch")
     import torch
+
     from google.protobuf import text_format
 
+    logger.info("Importing the DirectML backend")
+    from lczero_training.directml import device as dml_device
     from lczero_training.directml import derived_metrics
     from lczero_training.directml import metrics as metrics_sinks
     from lczero_training.directml import subprocess_eval
@@ -70,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
     from lczero_training.directml.training import TrainingBatch, evaluate
     from proto.root_config_pb2 import RootConfig
 
-    work_dir = pathlib.Path(args.work_dir)
+    logger.info("Imports done after %.1fs", time.perf_counter() - started)
+
     config = RootConfig()
     text_format.Parse(
         (work_dir / subprocess_eval.CONFIG_FILE).read_text(), config
@@ -78,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.kda_chunk_size:
         config.model.encoder.kda.chunk_size = args.kda_chunk_size
 
+    logger.info("Resolving the device")
     device = dml_device.resolve_device(args.device)
+    logger.info("Building the model on %s", device)
     model = LczeroModel(config.model)
     payload = torch.load(
         work_dir / subprocess_eval.WEIGHTS_FILE,
@@ -101,11 +152,18 @@ def main(argv: list[str] | None = None) -> int:
     # them, rather than all 50 up front.
     batches = (TrainingBatch.from_arrays(item, device) for item in arrays)
 
+    logger.info("Evaluating %d batch(es)", count)
+    forward_started = time.perf_counter()
     scalars = evaluate(
         model=model,
         loss_fn=LczeroLoss(config.training.losses),
         batches=batches,
         batch_count=count,
+    )
+    logger.info(
+        "%d forward pass(es) in %.1fs",
+        count,
+        time.perf_counter() - forward_started,
     )
     if not scalars:
         logger.error("No batches to evaluate in %s", work_dir)

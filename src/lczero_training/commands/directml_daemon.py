@@ -95,19 +95,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batches", type=int, default=50)
     parser.add_argument(
         "--eval-device",
+        default="cpu",
         help=(
-            "Device for the eval worker. Defaults to --device. Use cpu if "
-            "the trainer leaves too little for a second process to allocate "
-            "in -- slower, but it cannot compete for device memory."
+            "Device for the eval worker. CPU by default, and not as a "
+            "fallback: a worker that builds a second DX12 context while the "
+            "trainer holds 3.8 GB of shared memory did not finish importing "
+            "inside 900 s, where the same 50 batches take 15 s on the CPU "
+            "(5 s of that being `import torch`). Forward-only work at batch "
+            "32 is simply not worth a GPU here. directml:0 still works if "
+            "there is ever headroom to spare."
         ),
     )
     parser.add_argument(
         "--eval-timeout",
         type=float,
-        default=900.0,
+        default=300.0,
         help=(
             "Seconds before a stuck eval worker is killed and the eval "
-            "skipped. Raise it for --eval-device cpu."
+            "skipped. Every second of it is a second training is paused, so "
+            "this is a ceiling on the damage one bad eval can do -- 20x the "
+            "measured 15 s, which leaves room for a contended machine."
         ),
     )
     return parser

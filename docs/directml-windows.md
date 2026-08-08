@@ -189,6 +189,7 @@ the default budget. Or run the supervisor directly, with no TUI at all:
 | `--target-step N` | the finish line. Required; it rewrites the daemon's per-launch target, so pass it *before* the `--` |
 | `--restart-every N` | steps per launch before a proactive restart. `0` restarts only after a crash |
 | `--max-stalls N` | give up after N consecutive launches that advance the checkpoint by nothing (default 3) |
+| `--max-launches N` | stop after N launches even while making progress, a hard cap on an unattended run. `0` (default) means only `--target-step` ends it |
 | `--backoff S` | seconds to wait after a launch that made no progress |
 
 Headless, without the TUI:
@@ -205,8 +206,8 @@ Useful flags on both:
 | `--grad-accum N` | override `gradient_accumulation_steps` |
 | `--eval-every N` | evaluate on the held-out split every N **global** steps. Needs a split config |
 | `--eval-batches N` | batches per evaluation (default 50) |
-| `--eval-device D` | device for the eval worker. Defaults to `--device`; `cpu` if a second process cannot allocate |
-| `--eval-timeout S` | kill a stuck eval worker after S seconds and skip the eval (default 900) |
+| `--eval-device D` | device for the eval worker. **`cpu` by default** — see below |
+| `--eval-timeout S` | kill a stuck eval worker after S seconds and skip the eval (default 300) |
 | `--target-step N` | absolute step to stop at, checkpointing along the way |
 
 The first batch takes a few minutes — the loader indexes every tar and fills
@@ -221,22 +222,31 @@ batches to a scratch directory — host-side only, it no longer moves a single
 test batch to the device — and
 [`directml_eval_worker`](../src/lczero_training/commands/directml_eval_worker.py)
 does the forward passes, writes the `-test` TensorBoard run, and exits, which
-is what returns the memory. Training pauses for the few seconds it takes. A
-worker that fails or hangs is logged and the evaluation skipped; a measurement
-is never worth a run.
+is what returns the memory. A worker that fails or hangs is logged and the
+evaluation skipped; a measurement is never worth a run.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
+* **The worker runs on the CPU**, and that is not a fallback. Measured on this
+  machine: 50 batches take **15 s** on the CPU, 5 s of which is `import
+  torch`. On `directml:0`, beside a trainer holding 3.8 GB of the same shared
+  memory, the worker did not finish importing inside 900 s — it stalled
+  training for the full timeout and produced nothing. Fifty forward passes at
+  batch 32 do not need a GPU, and asking for one means contending for the
+  exact resource the run is short of. `--eval-device directml:0` is there if
+  you ever have headroom to spare.
 * `--eval-every` counts **global** steps. It used to count the loop index,
   which restarts every `steps_per_network` steps, so any value above that
   evaluated at the first and last step of every 1,000 — `--eval-every 5000`
   really meant every ~500 steps, ten times more often than asked, each one a
   permanent slice of device memory. If your eval curve suddenly has ten times
   fewer points than it used to, that is this.
-* The worker allocates on the device while the trainer still holds its own
-  3.8 GB. That fits here, but if you see `the eval worker exited with code 1`
-  with an allocation failure in the log, pass `--eval-device cpu` and raise
-  `--eval-timeout`. Correctness is identical; only the speed differs.
+* The worker writes its own `worker.log` into the scratch directory, and the
+  trainer quotes the tail of it if the eval fails. Look there first: the
+  worker's stderr goes to the trainer's log, but a worker killed on timeout
+  may never have reached it. This is how the 900 s stall above was diagnosed
+  only after the fact — the first version configured logging *after* importing
+  torch, so it died without emitting a byte.
 
 ### 3. Watch it
 
@@ -328,6 +338,14 @@ The chunkwise gated delta rule materializes a chunk x chunk score matrix per
 head, so memory grows with the square of the chunk size while the win from
 fewer sequential steps is linear. 8 is both the fastest and the smallest;
 there is no trade to make. 3.80 GB is the floor for this model at batch 32.
+
+**`TensorFlow installation not found - running with reduced feature set`** from
+TensorBoard — expected, and nothing to fix. The "reduced feature set" is the
+graph, profiler, and image/audio plugins; the scalar plugin is pure TensorBoard
+and this pipeline writes nothing but scalars. Do **not** install TensorFlow to
+silence it: it would pull a second protobuf runtime into `.venv-directml`
+against the pinned one the generated `proto` bindings need, for several hundred
+MB of resident memory on a machine that is already short of it.
 
 **`aten::<op> ... falling back to CPU`** in the log — a real performance cliff,
 not a warning to ignore. One fallback in the training step can dominate the

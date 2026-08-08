@@ -171,6 +171,26 @@ def test_progress_resets_the_stall_counter(run):
     assert len(trainer.commands) == 6
 
 
+def test_max_launches_caps_a_healthy_run(run):
+    """A hard ceiling on an unattended run, separate from --max-stalls: this
+    one stops launches that are all making progress."""
+    code, trainer = run(
+        [
+            "--target-step",
+            "500000",
+            "--restart-every",
+            "10000",
+            "--max-launches",
+            "2",
+        ],
+        advances=[10000, 10000, 10000, 10000],
+    )
+
+    assert code == 0, "hitting the cap is a clean stop, not a failure"
+    assert len(trainer.commands) == 2
+    assert trainer.target_steps() == [110000, 120000]
+
+
 def test_it_refuses_to_start_without_a_checkpoint(run):
     code, trainer = run(
         ["--target-step", "200000"], advances=[], start_step=None

@@ -128,6 +128,58 @@ def test_the_worker_evaluates_on_the_directml_device(
     _assert_a_usable_evaluation(relayed, tmp_path)
 
 
+def test_importing_the_worker_does_not_import_torch():
+    """The regression that cost fifteen minutes of a real run.
+
+    The worker used to import ``directml.device`` -- and so torch and
+    torch_directml -- at module scope, before ``basicConfig``. On a machine
+    with the trainer holding 3.8 GB of shared memory that import did not
+    return inside the 900 s timeout, and with no logging configured the
+    worker was killed having emitted nothing at all: a stall with no
+    evidence in it. Every heavy import has to happen inside ``main()``,
+    after logging exists, and this is the only way to state that as a rule
+    rather than a comment.
+
+    Checked in a child interpreter because torch is certainly already
+    imported in this one.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys;"
+        "import lczero_training.commands.directml_eval_worker;"
+        "print(int('torch' in sys.modules))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "0", (
+        "importing the eval worker pulled torch in at module scope; move it "
+        "inside main(), after logging is configured"
+    )
+
+
+def test_the_worker_logs_each_stage_to_its_own_file(tmp_path, monkeypatch):
+    """A worker killed on timeout may never reach the trainer's stderr, so
+    the stage log has to be on disk -- and has to start before the import
+    that is most likely to hang."""
+    relayed = _evaluate_through_a_real_worker(tmp_path, monkeypatch, "cpu")
+    assert relayed, "sanity: the worker should have succeeded"
+
+    recorded = (tmp_path / "work" / subprocess_eval.WORKER_LOG_FILE).read_text(
+        encoding="utf-8"
+    )
+    assert "Importing torch" in recorded
+    assert "Evaluating" in recorded
+    # The order is the point: a log line has to precede the risky import, not
+    # follow it.
+    assert recorded.index("starting in") < recorded.index("Importing torch")
+
+
 def test_a_failing_worker_does_not_stop_training(tmp_path, monkeypatch, caplog):
     """Evaluation is observational. Nothing it does is worth a run."""
     import logging
@@ -193,6 +245,12 @@ def test_a_hung_worker_is_killed_and_the_eval_skipped(
         hook(99)
 
     assert any("timed out" in record.message for record in caplog.records)
+    # No worker ran, so there is no log to quote -- but the message must say
+    # so rather than leaving the reader wondering where to look.
+    assert any(
+        "no log" in record.message or "empty" in record.message
+        for record in caplog.records
+    ), "a timeout must point at the worker's log, or say there is none"
 
 
 def test_a_stale_result_is_never_reported_as_a_fresh_one(tmp_path, monkeypatch):

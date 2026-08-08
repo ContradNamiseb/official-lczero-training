@@ -50,6 +50,7 @@ SUPERVISOR_FLAGS = (
     "--target-step",
     "--restart-every",
     "--max-stalls",
+    "--max-launches",
     "--backoff",
 )
 
@@ -116,6 +117,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Give up after this many consecutive launches that advance the "
             "checkpoint by nothing. Stops a misconfigured run from "
             "relaunching forever."
+        ),
+    )
+    parser.add_argument(
+        "--max-launches",
+        type=int,
+        default=0,
+        help=(
+            "Stop after this many launches even if they are all making "
+            "progress, leaving the checkpoint where it reached. A hard cap on "
+            "how long the run may go unattended; 0 means only --target-step "
+            "ends it."
         ),
     )
     parser.add_argument(
@@ -388,6 +400,16 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if args.checkpoint:
                 command += ["--checkpoint", args.checkpoint]
+
+            if args.max_launches and launches >= args.max_launches:
+                logger.info(
+                    "Stopping at the --max-launches cap of %d with the "
+                    "checkpoint at step %d of %d; rerun to carry on",
+                    args.max_launches,
+                    step,
+                    args.target_step,
+                )
+                return 0
 
             launches += 1
             logger.info(
