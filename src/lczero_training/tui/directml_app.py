@@ -37,6 +37,9 @@ from .log_pane import StreamingLogPane
 
 logger = logging.getLogger(__name__)
 
+_DAEMON_MODULE = "lczero_training.commands.directml_daemon"
+_SUPERVISOR_MODULE = "lczero_training.commands.directml_supervisor"
+
 _HISTORY = 60
 _SPARK = "▁▂▃▄▅▆▇█"
 # Drawn where a sample is not finite, so a NaN is visible as a gap rather
@@ -362,6 +365,7 @@ class DirectMlTuiApp(App):
         self._config_file = args.config
         self._logfile = getattr(args, "logfile", None)
         self._daemon_flags = list(getattr(args, "daemon_flags", []))
+        self._supervise = bool(getattr(args, "supervise", False))
         self._io_dump_file = getattr(args, "io_dump", None)
         self._io_dump = None
         self._history: dict[str, deque] = {}
@@ -369,14 +373,31 @@ class DirectMlTuiApp(App):
         self._scalars: dict[str, float] = {}
         self._last: Optional[TrainingMetricsPayload] = None
 
+    def _child_command(self) -> list[str]:
+        """The process to spawn: the daemon, or a supervisor wrapped round it.
+
+        Interchangeable from here. The supervisor hands the daemon its own
+        stdin, stdout and stderr, so the protocol arrives on the same pipe
+        either way and nothing in this app needs to know which it is talking
+        to -- including across a restart, which looks like a run whose step
+        count carries on from where the last checkpoint left it.
+        """
+        if not self._supervise:
+            return [sys.executable, "-m", _DAEMON_MODULE, *self._daemon_flags]
+
+        # Local so that importing this app does not drag the command modules
+        # in; the rest of the file follows the same rule.
+        from ..commands.directml_supervisor import partition_flags
+
+        supervisor_flags, daemon_flags = partition_flags(self._daemon_flags)
+        command = [sys.executable, "-m", _SUPERVISOR_MODULE, *supervisor_flags]
+        if daemon_flags:
+            command += ["--", *daemon_flags]
+        return command
+
     async def on_load(self) -> None:
         self._process = await anyio.open_process(
-            [
-                sys.executable,
-                "-m",
-                "lczero_training.commands.directml_daemon",
-                *self._daemon_flags,
-            ],
+            self._child_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

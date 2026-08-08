@@ -393,6 +393,58 @@ def build_model_and_optimizer(
     return model, optimizer
 
 
+def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
+    """Move every device tensor to the host one at a time. Returns the count.
+
+    For the emergency checkpoint path: after this the model's parameters
+    live on the host and it can no longer run a step on the device, so only
+    call it on a run that is ending.
+
+    ``make_checkpoint`` builds the whole host-side state dict in one
+    comprehension, which needs room for every parameter at once -- about
+    72 MB with the moments -- on a device that has just refused an
+    allocation. That is why the recovery checkpoint failed every time.
+    Copying one tensor at a time needs room for one tensor, and because
+    each copy drops its device original as it goes, the pressure only ever
+    falls: the transfer pays for itself after the first parameter.
+
+    Gradients go first, and the order is load-bearing twice over. They are
+    the same size as the parameters, no checkpoint wants them, and
+    discarding them needs no allocation at all, so they are the cheapest
+    relief available before the copying starts -- and a parameter left
+    holding a device gradient after its own data moves to the host is a
+    device mismatch waiting for the next thing that touches the pair.
+    """
+    model.zero_grad(set_to_none=True)
+
+    moved = 0
+    # keep_vars=True yields the Parameters and buffers themselves rather
+    # than detached copies, so assigning .data rebinds the storage the
+    # module actually holds. Setting .data (not the whole entry) is also
+    # what keeps each Parameter's identity, which the optimizer's state is
+    # keyed on -- rebuilding them would orphan the moments below.
+    for tensor in model.state_dict(keep_vars=True).values():
+        # A tied parameter appears under several names; the second visit
+        # already sees a host tensor.
+        if tensor.device.type == "cpu":
+            continue
+        tensor.data = tensor.data.detach().to("cpu")
+        moved += 1
+
+    if optimizer is not None:
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if value.device.type == "cpu":
+                    continue
+                state[key] = value.detach().to("cpu")
+                moved += 1
+
+    logger.info("Released %d tensor(s) from the device to the host", moved)
+    return moved
+
+
 def make_checkpoint(
     config: RootConfig,
     model: LczeroModel,

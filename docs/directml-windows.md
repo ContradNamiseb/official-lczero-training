@@ -162,6 +162,35 @@ Everything after the bare `--` is passed to the daemon. Use it rather than
 Press `q` to quit. `--io-dump FILE` records the raw daemon JSONL, which is the
 tool to reach for if a panel renders no data.
 
+**For a long or unattended run, add `--supervise`.** DirectML returns device
+memory to the OS only when the process exits, so a run of any length
+eventually dies with `Not enough memory resources are available` — the best
+one here managed 36,397 steps. `--supervise` puts the trainer under
+[`directml_supervisor`](../src/lczero_training/commands/directml_supervisor.py),
+which relaunches it from the last checkpoint after a crash and, by default,
+proactively every 15,000 steps so the restart is scheduled rather than a
+failure. The dashboard is unaffected: the supervisor hands the trainer its own
+streams, so the metrics arrive on the same pipe and the step count simply
+carries on.
+
+```powershell
+.\.venv-directml\Scripts\python.exe -m lczero_training.commands.directml_tui --config docs/kda_split.textproto --supervise --logfile train.log -- --target-step=1000000 --kda-chunk-size=8 --report-every=10 --eval-every=5000 --eval-batches=50 "--output=C:/Users/you/networks/net-{step}.pb.gz"
+```
+
+Each restart pays one data-loader startup, about four minutes — under 2% at
+the default budget. Or run the supervisor directly, with no TUI at all:
+
+```powershell
+.\.venv-directml\Scripts\python.exe -m lczero_training.commands.directml_supervisor --config docs/kda_split.textproto --target-step 1000000 --restart-every 15000 -- --kda-chunk-size=8 --report-every=10
+```
+
+| supervisor flag | effect |
+|---|---|
+| `--target-step N` | the finish line. Required; it rewrites the daemon's per-launch target, so pass it *before* the `--` |
+| `--restart-every N` | steps per launch before a proactive restart. `0` restarts only after a crash |
+| `--max-stalls N` | give up after N consecutive launches that advance the checkpoint by nothing (default 3) |
+| `--backoff S` | seconds to wait after a launch that made no progress |
+
 Headless, without the TUI:
 
 ```powershell
@@ -252,6 +281,11 @@ other applications before a long run; a browser or editor holding 1-2 GB is
 the difference between fitting and not. Two runs differing only in
 `gradient_accumulation_steps` (8 and 4) failed at 380 s and 423 s, which is
 the same wall in both cases.
+
+Fragmentation then makes the wall arrive earlier over time, and nothing in the
+process can undo it: only process exit returns a DX12 context. That is what
+`--supervise` is for — see [Train](#2-train). It does not raise the ceiling; it
+makes hitting it cost a four-minute restart instead of a dead run.
 
 `kda.chunk_size` is not a lever either — it is already at its best value.
 Sweeping it on the same machine, trainer only, ~3 minutes per size:

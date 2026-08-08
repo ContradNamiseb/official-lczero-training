@@ -2,7 +2,10 @@
 
 This path failed silently twice in real runs: two out-of-memory crashes at
 steps 136756 and 136821 left no checkpoint at all, so every step since the
-last scheduled one was lost. Both causes are covered here.
+last scheduled one was lost. It then went on failing loudly -- clearing the
+exception's frames was not enough on a device with nothing left to give --
+which is what the host-transfer and drop-the-optimizer stages address. Every
+cause is covered here.
 """
 
 import pathlib
@@ -102,6 +105,94 @@ def test_emergency_save_clears_the_traceback_frames():
             r for r in gc.get_referrers(holder["ref"]) if isinstance(r, dict)
         ]
         assert referrers, "sanity: our own reference should still be found"
+
+
+def test_release_to_host_drops_gradients_and_hosts_every_tensor():
+    """Stage two of the emergency save, and the reason it works.
+
+    Every copy releases its device original, so the transfer only ever
+    lowers pressure -- unlike ``make_checkpoint``, which needs room for the
+    whole state dict at once. There is no DirectML device in CI, so this
+    checks the invariants that hold on any device: the gradients are gone,
+    nothing is left un-hosted, and the parameters keep their identity so
+    the optimizer's state stays keyed on them.
+    """
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.optimizer import NAdamW
+    from lczero_training.directml.training import release_to_host
+
+    config = _tiny_config()
+    model = LczeroModel(config.model)
+    parameters = list(model.parameters())
+    optimizer = NAdamW([{"params": parameters, "weight_decay": 0.0}], lr=1e-4)
+    identities = [id(param) for param in parameters]
+
+    # A step's worth of gradients and one optimizer step, so there are
+    # moments to move.
+    for param in parameters:
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert optimizer.state, "sanity: the optimizer should hold moments"
+
+    release_to_host(model, optimizer)
+
+    assert all(param.grad is None for param in parameters), (
+        "gradients are the cheapest memory to give back and no checkpoint "
+        "wants them"
+    )
+    assert [id(param) for param in parameters] == identities, (
+        "rebuilding the parameters would orphan the optimizer's state"
+    )
+    assert all(
+        tensor.device.type == "cpu"
+        for tensor in model.state_dict(keep_vars=True).values()
+    )
+    assert all(
+        value.device.type == "cpu"
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+def test_emergency_save_falls_back_to_dropping_the_optimizer_state(
+    tmp_path, caplog
+):
+    """The last resort: momentum is worth far less than the steps.
+
+    An unsaveable optimizer state stands in for one the device cannot
+    produce a host copy of. The checkpoint must still be written, must say
+    that it is momentum-less, and must be loadable.
+    """
+    import logging
+
+    from lczero_training.directml import checkpoint as checkpoint_io
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.optimizer import NAdamW
+
+    config = _tiny_config()
+    model = LczeroModel(config.model)
+    parameters = list(model.parameters())
+    optimizer = NAdamW([{"params": parameters, "weight_decay": 0.0}], lr=1e-4)
+    for param in parameters:
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    # Unpicklable, so torch.save refuses any checkpoint carrying it. A
+    # local function is the simplest thing pickle cannot handle.
+    optimizer.state[parameters[0]]["unsaveable"] = lambda: None
+
+    with caplog.at_level(logging.WARNING):
+        _emergency_save(
+            config, model, optimizer, 4242, str(tmp_path), RuntimeError("oom")
+        )
+
+    restored = checkpoint_io.load_latest(str(tmp_path))
+    assert restored is not None, "the fallback save must still land"
+    assert restored.step == 4242
+    assert restored.optimizer_state is None
+    assert any(
+        "without momentum" in record.message for record in caplog.records
+    ), "a momentum-less checkpoint must announce itself"
 
 
 def test_emergency_save_reports_rather_than_raising(tmp_path, caplog):

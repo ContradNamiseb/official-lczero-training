@@ -24,11 +24,13 @@ Run to restart with:
 
 ```powershell
 .\.venv-directml\Scripts\python.exe -m lczero_training.commands.directml_tui `
-  --config docs/kda_split.textproto --logfile train.log -- `
+  --config docs/kda_split.textproto --supervise --logfile train.log -- `
   --kda-chunk-size=8 --report-every=10 --target-step=1000000 --gc-every=500 `
   --eval-every=5000 --eval-batches=50 `
   "--output=C:/Users/Contrad/Documents/lc0-directml-networks/kda-native-{step}.pb.gz"
 ```
+
+`--supervise` is new and is what makes a long run survive; see §3.
 
 **Is it learning?** Yes, but only the policy head, and slowly. Over 34,000
 steps of held-out evaluation: policy loss −0.066 (t = −5.6), policy
@@ -101,24 +103,51 @@ Everything the guide recommends short of a subprocess is **already done**:
 Since DX12 memory returns to the OS solely on process exit, the robust
 architecture is to stop fighting the allocator and restart around it:
 
-1. **Evaluation in a subprocess.** `--eval-every` currently runs eval
-   inside the training process, and the second data pipeline sits resident
-   between evaluations. Spawning a worker that loads the exported `.pb.gz`,
-   evaluates, writes TensorBoard and exits gives a guaranteed flush.
-2. **Supervised restart of the trainer.** The daemon already checkpoints
-   every `steps_per_network` (1,000) steps and resumes exactly. A wrapper
-   that restarts it on OOM — or proactively every N thousand steps —
-   converts an unavoidable leak into a scheduled, lossless event.
+1. **Evaluation in a subprocess.** Still open — see §4.2. `--eval-every`
+   runs eval inside the training process, and the second data pipeline sits
+   resident between evaluations. Spawning a worker that loads the exported
+   `.pb.gz`, evaluates, writes TensorBoard and exits gives a guaranteed
+   flush.
+2. **Supervised restart of the trainer.** **Done.**
+   `commands/directml_supervisor.py`, reached with
+   `lc0-directml-tui --supervise` or run directly. The daemon already
+   checkpointed every `steps_per_network` (1,000) steps and resumed
+   exactly, so a process restart was already lossless; the supervisor turns
+   that into the recovery mechanism. It relaunches after a crash and
+   proactively every `--restart-every` steps (default 15,000, comfortably
+   inside the 36,397-step best run) so the restart is scheduled rather than
+   a failure.
 
-(2) is what makes unattended training work, and it depends on §4.1.
+   Details worth not rediscovering:
+
+   * The daemon inherits the supervisor's stdin/stdout/stderr, so the JSONL
+     protocol reaches the TUI untouched and there is **no relay code**. Both
+     processes therefore have to keep stdout clean and log to stderr.
+   * Each launch gets its own nearer `--target-step`, so it exits cleanly —
+     checkpointing and exporting on the way out — instead of being killed
+     at an arbitrary step. `partition_flags` is the one place that knows
+     which flags belong to the supervisor rather than the daemon; the TUI
+     imports it so the two cannot drift.
+   * The child runs in a **Windows job object** with
+     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Terminating a process does not
+     touch its children on Windows, and the TUI calls `terminate()` on
+     quit — an orphaned trainer would keep holding gigabytes of DX12 memory
+     while the replacement started. Verified by killing a supervisor with
+     `TerminateProcess` and watching the child die with it.
+   * A no-progress circuit breaker (`--max-stalls`, default 3) stops a
+     misconfigured run relaunching forever.
+   * `checkpoint.py` imports `torch` inside `save`/`load_latest` rather than
+     at the top, so the supervisor can poll `latest_step` without paying a
+     few hundred MB of RSS out of the trainer's headroom. Do not hoist it
+     back.
 
 ---
 
 ## 4. Open problems, ranked
 
-### 4.1 The recovery checkpoint still fails — fix this first
+### 4.1 The recovery checkpoint — fixed, but unverified against a real OOM
 
-On OOM the daemon tries to checkpoint what completed. It fails every time:
+`_emergency_save` in `directml/daemon.py` used to fail every time:
 
 ```
 E Training stopped at step 191203: Not enough memory resources are available
@@ -126,22 +155,47 @@ E Could not save a recovery checkpoint at step 191203; progress since the
   last checkpoint is lost
 ```
 
-`_emergency_save` in `directml/daemon.py` already clears the exception's
-traceback frames (they pin the failed step's activations) and forces a
-collection before saving, and it reports rather than failing silently. It
-is still not enough. A save needs ~72 MB of host copies of the parameters
-and both optimizer moments, on a device that has just run out.
+Clearing the exception's traceback frames — which pin the failed step's
+activations — was necessary but nowhere near sufficient. A save needs ~72 MB
+of host copies of the parameters and both optimizer moments, all at once,
+on a device that has just refused an allocation. There are now three stages,
+cheapest first:
 
-Ideas not yet tried: stream the state dict tensor-by-tensor to disk instead
-of building the whole dict; drop the optimizer state from the emergency
-save (losing momentum is far better than losing the steps); free the model
-from the device before copying.
+1. Clear the frames and collect, as before.
+2. `training.release_to_host` — drop the gradients (same size as the
+   parameters, no checkpoint wants them, and discarding them allocates
+   nothing), then move parameters, buffers and optimizer moments to the
+   host **one tensor at a time**. Each copy releases its device original,
+   so pressure only ever falls; the transfer pays for itself after the
+   first parameter. This is the change that should make it work. It sets
+   `.data` in place rather than rebuilding the Parameters, because the
+   optimizer's state is keyed on their identity.
+3. Retry without the optimizer state if a save still fails. A momentum-less
+   resume calls `optimizer.set_step(step)`, so the bias correction does not
+   treat a network at step 191,000 as if it were on its first — without
+   that the first updates would be full-rate sign steps.
 
-There is also a secondary `RuntimeError: resource deadlock would occur`
-during cleanup after some OOMs. Possibly the forced `gc.collect()` running
-while loader threads hold locks — unconfirmed.
+The model is left on the host afterwards, so it must not be trained again;
+every caller is on its way out of `run()`.
 
-### 4.2 Where a NaN came from
+**Still unverified against a real out-of-memory crash.** The unit tests
+cover the invariants and the fallback tier, but no CI machine has a
+DirectML adapter to run out of. Watch the log on the next OOM: the success
+line is `Saved recovery checkpoint at step N`, and the supervisor's next
+launch should resume from that step rather than the last scheduled one.
+
+The secondary `RuntimeError: resource deadlock would occur` during cleanup
+after some OOMs is unchanged and still unexplained — possibly the forced
+`gc.collect()` running while loader threads hold locks. It is caught and
+reported by the `finally` in `run()`, so it costs nothing but a log line.
+
+### 4.2 Evaluation still runs in the training process
+
+§3.1, now the largest remaining piece of the memory work. `--eval-every`
+holds a second data pipeline resident between evaluations, inside the
+process that cannot give memory back.
+
+### 4.3 Where a NaN came from
 
 One run died because a NaN reached the TUI. The model was healthy either
 side of it, which does not fit a NaN loss (those poison the weights
@@ -149,7 +203,7 @@ permanently). Non-finite metrics are now logged with their step and name;
 that evidence did not exist before. Watch for `Non-finite metric from the
 daemon at step N`.
 
-### 4.3 Three untrained heads
+### 4.4 Three untrained heads
 
 `optimistic_st`, `q` and `st` have no loss entries, so they get no gradient
 and export at their imported values. **Deliberate.** lc0 defaults to
@@ -157,7 +211,7 @@ and export at their imported values. **Deliberate.** lc0 defaults to
 them costs ~10% throughput and, with the reference weights, would move 76%
 of the gradient budget onto heads the engine does not use. Leave them.
 
-### 4.4 lc0 has never loaded an exported net
+### 4.5 lc0 has never loaded an exported net
 
 The single unverified acceptance criterion. Export round-trips through our
 own importer, but no lc0 binary has read one.
@@ -212,5 +266,5 @@ absolute times drift several percent with background load.
 * `docs/kda_split.textproto` — the live config.
 
 Tests: `.\.venv-directml\Scripts\python.exe -m pytest src\lczero_training -q`
-(206 passed, 1 skipped). `src/lczero_training/conftest.py` handles the WSL
-`.so` symlink, so no `--ignore` is needed any more.
+(222 passed, 1 skipped, ~3 min). `src/lczero_training/conftest.py` handles
+the WSL `.so` symlink, so no `--ignore` is needed any more.

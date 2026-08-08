@@ -55,6 +55,7 @@ lc0-directml-init = "lczero_training.commands.directml_init:main"
 lc0-directml-train = "lczero_training.commands.directml_train:main"
 lc0-directml-export = "lczero_training.commands.directml_export:main"
 lc0-directml-daemon = "lczero_training.commands.directml_daemon:main"
+lc0-directml-supervisor = "lczero_training.commands.directml_supervisor:main"
 lc0-directml-tui = "lczero_training.commands.directml_tui:main"
 
 [project.optional-dependencies]

@@ -128,7 +128,22 @@ class DirectMlTrainingDaemon:
         handled still holds the whole failed step alive. Python keeps a
         traceback on the exception, every frame in it keeps its locals, and
         those locals are the activations that could not be allocated around.
-        Clearing the frames first is what makes the save possible.
+
+        Clearing those frames was necessary but nowhere near sufficient --
+        the save still failed on every real out-of-memory crash -- so there
+        are three stages, cheapest first:
+
+        1. Drop the exception's frames and collect, so nothing from the
+           failed step is still referenced.
+        2. Get the weights off the device one tensor at a time. See
+           ``release_to_host``: this *reduces* device pressure as it runs,
+           where building the whole state dict demanded ~72 MB at once.
+        3. If a save still fails, retry without the optimizer state. Losing
+           the moments costs a few perturbed steps on resume; losing the
+           checkpoint costs every step since the last scheduled one.
+
+        The model is left on the host, so the caller must not train it
+        afterwards. Every caller is on its way out of ``run``.
         """
         import gc
         import traceback
@@ -137,28 +152,67 @@ class DirectMlTrainingDaemon:
         # that function, so referencing them from this method would raise
         # NameError at precisely the moment the checkpoint matters.
         from lczero_training.directml import checkpoint as checkpoint_io
-        from lczero_training.directml.training import make_checkpoint
+        from lczero_training.directml.training import (
+            make_checkpoint,
+            release_to_host,
+        )
 
         if error.__traceback__ is not None:
             traceback.clear_frames(error.__traceback__)
         gc.collect()
 
         try:
-            checkpoint_io.save(
-                directory,
-                make_checkpoint(config, model, optimizer, step),
-                max_to_keep=config.training.checkpoint.max_to_keep,
-            )
-            logger.info("Saved recovery checkpoint at step %d", step)
+            release_to_host(model, optimizer)
         except Exception:  # noqa: BLE001
-            # Never mask the original failure with this one, but never fail
-            # silently either -- the whole point is that the user knows
-            # whether the steps since the last checkpoint survived.
+            # Worth trying the save anyway: whatever was transferred before
+            # the failure is device memory the save no longer has to find.
             logger.exception(
-                "Could not save a recovery checkpoint at step %d; "
-                "progress since the last checkpoint is lost",
+                "Could not move every tensor to the host before the "
+                "recovery checkpoint at step %d; saving anyway",
                 step,
             )
+
+        def attempt(with_optimizer: bool) -> bool:
+            try:
+                checkpoint_io.save(
+                    directory,
+                    make_checkpoint(
+                        config,
+                        model,
+                        optimizer if with_optimizer else None,
+                        step,
+                    ),
+                    max_to_keep=config.training.checkpoint.max_to_keep,
+                )
+            except Exception:  # noqa: BLE001
+                # Never mask the original failure with this one, but never
+                # fail silently either -- the whole point is that the user
+                # knows whether the steps since the last checkpoint
+                # survived.
+                logger.exception(
+                    "Recovery checkpoint at step %d failed %s the optimizer "
+                    "state",
+                    step,
+                    "with" if with_optimizer else "without",
+                )
+                return False
+            return True
+
+        if attempt(with_optimizer=True):
+            logger.info("Saved recovery checkpoint at step %d", step)
+            return
+        if attempt(with_optimizer=False):
+            logger.warning(
+                "Saved a recovery checkpoint at step %d without the "
+                "optimizer state; the resumed run starts without momentum",
+                step,
+            )
+            return
+        logger.error(
+            "Could not save a recovery checkpoint at step %d; progress "
+            "since the last checkpoint is lost",
+            step,
+        )
 
     def _apply_data_phasing(self, config, step: int) -> None:
         """Restrict the corpus to the current phase's tars via a farm.
@@ -333,6 +387,20 @@ class DirectMlTrainingDaemon:
         model.to(device)
         if restored.optimizer_state is not None:
             optimizer.load_state_dict(restored.optimizer_state)
+        else:
+            # A checkpoint with no moments -- the emergency save's last
+            # resort. Starting the moments at zero is unavoidable, but
+            # leaving their step counters at zero as well is not: the bias
+            # correction would treat a network at step 191000 as if it were
+            # on its first, and the first updates would be full-rate sign
+            # steps. Fast-forwarding the counters keeps them the size the
+            # schedule intends.
+            logger.warning(
+                "Checkpoint at step %d has no optimizer state; resuming "
+                "without momentum",
+                restored.step,
+            )
+            optimizer.set_step(restored.step)
 
         # One "segment" is a checkpoint interval; --target-step keeps the
         # loader warm across many of them in this one process, which is what

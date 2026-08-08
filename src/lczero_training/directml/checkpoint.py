@@ -7,6 +7,13 @@ dict is enough for a single-process trainer.
 Checkpoints are written to a temporary file and renamed, so an interrupted
 save cannot leave a half-written checkpoint that the next run would try to
 resume from.
+
+``torch`` is imported inside ``save`` and ``load_latest`` rather than at the
+top. The rest of this module -- the filename convention, ``latest_step``,
+``config_digest`` -- is pure filesystem and protobuf work, and the restart
+supervisor polls ``latest_step`` while a trainer is running on a machine
+with 4-5 GB free. Importing torch there would cost a few hundred megabytes
+of the headroom the trainer needs.
 """
 
 from __future__ import annotations
@@ -18,8 +25,6 @@ import os
 import pathlib
 import re
 from typing import Any
-
-import torch
 
 from proto import model_config_pb2
 from proto.root_config_pb2 import RootConfig
@@ -85,6 +90,8 @@ def save(
     max_to_keep: int = 0,
 ) -> pathlib.Path:
     """Write a checkpoint atomically. Returns the path written."""
+    import torch
+
     path = pathlib.Path(directory)
     path.mkdir(parents=True, exist_ok=True)
     destination = path / _FILENAME.format(step=checkpoint.step)
@@ -123,6 +130,8 @@ def load_latest(
     ignore_config_mismatch: bool = False,
 ) -> Checkpoint | None:
     """Load the highest-step checkpoint, or None if there are none."""
+    import torch
+
     files = _checkpoint_files(pathlib.Path(directory))
     if not files:
         return None
