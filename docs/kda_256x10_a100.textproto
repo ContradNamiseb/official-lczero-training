@@ -1,0 +1,337 @@
+# KDA 256x10 on 4x A100 -- an ablation-comparable config.
+#
+# This is the JAX/CUDA trainer (lc0-train / lc0-tui), NOT the DirectML port.
+# The DirectML work in this repo is a Windows/iGPU path and none of its
+# memory tuning applies here; anything in docs/kda_split.textproto that looks
+# oddly small is working around a 5,965 MB shared-memory cap that an A100
+# does not have.
+#
+# Every path below is a placeholder. Search for CHANGEME.
+#
+# Architecture: 10 encoder blocks, d_model 256, mixer pattern [KDA, KDA, KDA,
+# MHA] tiled over the tower -> 8 KDA blocks and 2 MHA blocks. Scaled from a
+# working 128x4 by widening only what is structurally tied to d_model, so the
+# comparison isolates depth and width rather than a dozen simultaneous
+# changes. The two hard constraints are noted at their fields.
+
+data_loader {
+  stage {
+    name: "file_path_provider"
+    file_path_provider {
+      directory: "CHANGEME/path/to/training-data"  # directory of .tar files
+      output { queue_capacity: 64 }
+    }
+  }
+  stage {
+    name: "chunk_source_loader"
+    input: "file_path_provider"
+    chunk_source_loader {
+      # Startup cost, not steady-state: this indexes every tar before the
+      # first batch. Measured on a 4-core laptop over an 89 GB corpus,
+      # 1 thread took 460 s and 4 took 117 s. Set this near the core count;
+      # the threads idle on the input queue once the scan is done.
+      threads: 16
+      output { queue_capacity: 64 }
+      frame_format: V7TrainingData
+    }
+  }
+  stage {
+    name: "chunk_source_splitter"
+    input: "chunk_source_loader"
+    chunk_source_splitter {
+      output { name: "train" queue_capacity: 64 }
+      output { name: "test"  queue_capacity: 8 }
+      weight: 99
+      weight: 1
+    }
+  }
+
+  # --- train branch ------------------------------------------------------
+  # Sized for the real constraint here: 4096 positions/step at ~19 steps/s is
+  # roughly 21,000 positions/second the loader must sustain, or the GPUs
+  # starve. If step time is much worse than expected, check the loader's
+  # queue metrics before blaming the model.
+  stage {
+    name: "train_shuffling_chunk_pool"
+    input: "chunk_source_splitter.train"
+    shuffling_chunk_pool {
+      # A sampling WINDOW, not a buffer: the pool draws from the last N
+      # chunks it has seen, so anything below the corpus size silently trains
+      # on a slice of it, and the indexing loop discards sources it never
+      # reached -- oldest first, with no error. Keep it above
+      # (number of tars) x 10000. CHANGEME to match the corpus.
+      chunk_pool_size: 10000000
+      source_ingestion_threads: 4
+      chunk_loading_threads: 16
+      output { queue_capacity: 64 }
+    }
+  }
+  stage {
+    name: "train_chunk_rescorer"
+    input: "train_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 16
+      output { queue_capacity: 64 }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+      # syzygy_paths: "CHANGEME/path/to/syzygy"  # optional; skipped if unset
+    }
+  }
+  stage {
+    name: "train_chunk_unpacker"
+    input: "train_chunk_rescorer"
+    chunk_unpacker {
+      threads: 8
+      position_sampling_rate: 0.5
+      output { queue_capacity: 64 }
+    }
+  }
+  stage {
+    name: "train_shuffling_frame_sampler"
+    input: "train_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 8
+      # PER THREAD. Total reservoir is this times threads, so 8 x 65536 is
+      # about 500k frames held in host RAM. Lower it if the box is short.
+      reservoir_size_per_thread: 65536
+      output { queue_capacity: 64 }
+    }
+  }
+  stage {
+    name: "train_tensor_generator"
+    input: "train_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 4
+      # 4096 = 1,024 per GPU across 4 devices. The trainer sharded the batch
+      # across jax.devices() automatically, so this MUST stay divisible by
+      # the device count. 1B positions / 4096 is ~250k steps.
+      batch_size: 4096
+      output { queue_capacity: 16 }
+    }
+  }
+
+  # --- test branch -------------------------------------------------------
+  stage {
+    name: "test_shuffling_chunk_pool"
+    input: "chunk_source_splitter.test"
+    shuffling_chunk_pool {
+      chunk_pool_size: 10000000
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output { queue_capacity: 16 }
+    }
+  }
+  stage {
+    name: "test_chunk_rescorer"
+    input: "test_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 2
+      output { queue_capacity: 16 }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "test_chunk_unpacker"
+    input: "test_chunk_rescorer"
+    chunk_unpacker {
+      threads: 2
+      position_sampling_rate: 0.5
+      output { queue_capacity: 16 }
+    }
+  }
+  stage {
+    name: "test_shuffling_frame_sampler"
+    input: "test_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 8192
+      output { queue_capacity: 16 }
+    }
+  }
+  stage {
+    name: "test_tensor_generator"
+    input: "test_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 4096
+      output { queue_capacity: 8 }
+    }
+  }
+
+  output: "train:train_tensor_generator"
+  output: "test:test_tensor_generator"
+}
+
+training {
+  schedule {
+    # One checkpoint and one exported network per 5,000 steps: 50 over a
+    # 250k-step run. At 1000 (the small-scale default) that is 250 exports.
+    steps_per_network: 5000
+    chunks_per_network: 500
+  }
+
+  # Warmup then cosine decay, sized for a 250k-step run from scratch. The
+  # single flat rate in kda_split.textproto is for resuming an imported net
+  # mid-training and is wrong for this.
+  #   0 -> 2,000        linear 0 -> 1e-3   (warmup)
+  #   2,000 -> 250,000  cosine 1e-3 -> 1e-5
+  #   250,000+          constant 1e-5
+  lr_schedule {
+    starting_step: 0
+    duration_steps: [2000, 248000, 0]
+    lr: [0.0, 0.001, 0.00001]
+    transition: [LINEAR, COSINE, CONSTANT]
+  }
+
+  checkpoint {
+    path: "CHANGEME/path/to/checkpoints"
+    max_to_keep: 5
+  }
+
+  optimizer {
+    nadamw {
+      beta_1: 0.9
+      beta_2: 0.98
+      epsilon: 1e-07
+      weight_decay: 0.0001
+      # Decay the head weights and the main tower; skip biases, layernorms
+      # and the input embedding.
+      decay_selector {
+        rule { match: "**/bias" }
+        rule { match: "**/ln*/**" }
+        rule { match: "**/embedding/embedding/**" }
+        rule { match: "**/policy_heads/**"   include: true }
+        rule { match: "**/value_heads/**"    include: true }
+        rule { match: "**/movesleft_heads/**" include: true }
+      }
+    }
+  }
+
+  losses {
+    policy {
+      head_name: "vanilla"
+      metric_name: "main_ce"
+      weight: 1.0
+      illegal_moves: MASK
+      type: CROSS_ENTROPY
+    }
+    value { head_name: "winner" weight: 1.0 }
+    movesleft { head_name: "main" weight: 1.0 }
+  }
+
+  max_grad_norm: 16.0
+  # 1, not 4. Accumulation exists to buy an effective batch out of small
+  # steps on a memory-starved device; an A100 has the memory to do 4096 in
+  # one pass, and accumulation would only cost optimizer steps.
+  gradient_accumulation_steps: 1
+}
+
+model {
+  defaults {
+    # BF16 on A100 tensor cores. The DirectML config pins F32 because that
+    # path has no working half precision; this one does not have that
+    # problem. Drop to F32 if anything looks numerically off.
+    compute_dtype: BF16
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+
+  embedding {
+    dense_size: 64
+    embedding_size: 256
+    dff: 256
+  }
+
+  encoder {
+    num_blocks: 10
+    d_model: 256
+    dff: 256
+    # 16, and it must stay a multiple of len(directions) below -- the model
+    # asserts on it. 16 heads over 8 directions is 2 heads per direction.
+    heads: 16
+
+    smolgen {
+      hidden_channels: 8
+      hidden_size: 64
+      gen_size: 64
+      activation: ACTIVATION_SWISH
+    }
+
+    kda {
+      # key_dim is CAPPED AT 32 by the SYCL inference kernel, which keeps a
+      # per-work-item state array of this width. A net trained above 32 will
+      # not run on that backend. Do not raise it.
+      key_dim: 32
+      # 16 heads x 32 = 512 = 2 x d_model, the same key/value depth ratio the
+      # 128x4 net used (8 x 32 = 256 = 2 x 128).
+      value_dim: 32
+      # Bottleneck rank of the low-rank decay/beta pairs. d_model / 4.
+      gate_rank: 64
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+      # Pure speed knob: the chunked recurrence is mathematically identical
+      # at any chunk size, trading a bigger per-chunk score matrix for fewer
+      # sequential steps. The DirectML path is pinned to 8 by memory; an
+      # A100 should prefer larger. Worth sweeping 32/64/128 once.
+      chunk_size: 64
+    }
+
+    # Tiled with index % 4 over 10 blocks -> K K K M K K K M K K.
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_MHA
+  }
+
+  shared_policy_embedding_size: 256
+
+  policy_head { name: "vanilla" d_model: 256 }
+  # Present so the exported net matches the reference layout. It gets no
+  # loss entry above, so it receives no gradient and exports at its
+  # initialised values -- lc0 defaults to policy_head=vanilla and ignores it.
+  # Adding a loss for it costs throughput and moves gradient budget onto a
+  # head the engine does not use.
+  policy_head { name: "optimistic_st" d_model: 256 }
+
+  value_head { name: "winner" num_channels: 128 }
+  value_head {
+    name: "q"
+    num_channels: 128
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  value_head {
+    name: "st"
+    num_channels: 128
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+
+  movesleft_head { name: "main" num_channels: 64 }
+}
+
+metrics {
+  tensorboard_path: "CHANGEME/path/to/tensorboard"
+}
+
+export {
+  destination_filename: "CHANGEME/path/to/networks/kda-256x10-{step}.pb.gz"
+}
