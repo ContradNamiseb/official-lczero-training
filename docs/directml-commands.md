@@ -130,6 +130,24 @@ Measured at a real failure: adapter at **5,865 MB of 5,965 — 98%** — while
 dropped to ~1,280 MB the moment the process exited, which is the only way
 DirectML ever gives it back.
 
+**If runs have been crashing, reset the GPU state before the next one.**
+After a morning of failures, clearing the D3D shader cache and restarting the
+display driver produced a run that held 880 ms/step and *flat* GPU memory for
+2,000 steps:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\reset-gpu-state.ps1
+```
+
+Then press **Ctrl+Shift+Win+B** — the screen blanks for a second and the
+display driver restarts. Which of the two actually does the work is not
+established: the shader cache is a few MB on disk and holds compiled shaders,
+not GPU allocations, so its size does not explain a memory symptom. The driver
+reset is the likelier half, because it reclaims allocations left behind by
+processes that died badly. A clean exit does return its own memory (the
+adapter drops from ~5,100 MB to ~1,200 MB), but a process killed mid-flight
+may not. Treat this as a remedy after crashes, not a ritual before every run.
+
 System RAM still matters for speed (thrashing slows steps: ~930 ms/step with
 3-4 GB free, ~4,400 ms with under 1.4 GB), just not for these crashes:
 

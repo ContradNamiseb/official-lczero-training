@@ -342,6 +342,7 @@ class DirectMlTrainingDaemon:
         from lczero_training.directml.training import (
             batches_from_loader,
             build_model_and_optimizer,
+            describe_error,
             make_checkpoint,
             release_to_host,
             train,
@@ -535,8 +536,13 @@ class DirectMlTrainingDaemon:
                 self._export(config, model, final_step)
         except (RuntimeError, KeyboardInterrupt) as error:
             final_step = progress["step"]
-            failed_message = str(error)
-            logger.error("Training stopped at step %d: %s", final_step, error)
+            # describe_error, not str(): a Ctrl-C carries no message at all,
+            # and "Training stopped at step N:" followed by nothing is what
+            # the TUI would then show as the reason it failed.
+            failed_message = describe_error(error)
+            logger.error(
+                "Training stopped at step %d: %s", final_step, failed_message
+            )
             # Save whatever completed rather than losing the segment.
             if final_step > start_step:
                 self._emergency_save(

@@ -444,6 +444,19 @@ def build_model_and_optimizer(
     return model, optimizer
 
 
+def describe_error(error: BaseException) -> str:
+    """A description that names the failure even when it carries no message.
+
+    ``KeyboardInterrupt`` stringifies to the empty string, so a deliberate
+    Ctrl-C logged ``Training stopped at step 197835:`` and stopped there --
+    indistinguishable from a crash that lost its message, in a log where
+    telling those apart is the whole job. The exception type is never empty.
+    """
+    text = str(error).strip()
+    name = type(error).__name__
+    return f"{name}: {text}" if text else name
+
+
 def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
     """Move every device tensor to the host one at a time. Returns the count.
 

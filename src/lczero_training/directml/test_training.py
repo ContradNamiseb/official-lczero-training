@@ -30,6 +30,23 @@ def _config() -> RootConfig:
     return config
 
 
+def test_describe_error_names_an_exception_that_carries_no_message():
+    """A real run logged "Training stopped at step 197835:" and nothing else.
+
+    That was a deliberate Ctrl-C -- KeyboardInterrupt stringifies to the
+    empty string -- but it read exactly like a crash whose message had been
+    lost, in a log whose entire job is telling those apart.
+    """
+    from lczero_training.directml.training import describe_error
+
+    assert describe_error(KeyboardInterrupt()) == "KeyboardInterrupt"
+    assert describe_error(RuntimeError("")) == "RuntimeError"
+    assert (
+        describe_error(RuntimeError("Not enough memory resources"))
+        == "RuntimeError: Not enough memory resources"
+    )
+
+
 def test_training_segments_reach_absolute_target():
     segments = list(training_segments(1000, 1_000_000, 1000))
 
@@ -885,4 +902,3 @@ def test_release_to_host_clears_scratch_and_moves_tensors():
     assert len(optimizer._scratch) == 0
     for p in model.parameters():
         assert p.device.type == "cpu"
-

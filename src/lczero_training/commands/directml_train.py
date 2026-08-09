@@ -382,7 +382,11 @@ def main(argv: list[str] | None = None) -> int:
         # next invocation resume from there.
         failed = True
         final_step = progress["step"]
-        logging.error("Training stopped at step %d: %s", final_step, error)
+        from lczero_training.directml.training import describe_error
+
+        logging.error(
+            "Training stopped at step %d: %s", final_step, describe_error(error)
+        )
     finally:
         logging.info("Stopping the data loader")
         try:
