@@ -13,7 +13,26 @@ data_loader {
     name: "chunk_source_loader"
     input: "file_path_provider"
     chunk_source_loader {
-      threads: 1
+      # This one number is almost the whole startup cost. Indexing the 345
+      # tars means reading headers across an 89 GB corpus, and at threads: 1
+      # it ran strictly sequentially at ~1.2 s per tar. Measured to the first
+      # batch, loader only, no trainer:
+      #
+      #   threads: 1   460 s
+      #   threads: 4   117 s
+      #   threads: 6    97 s
+      #
+      # 4, not 6: the machine has 4 physical cores, and the runs were timed
+      # in the order 4, 1, 6, so 6 had the warmest file cache and 4 the
+      # coldest -- the 4-vs-1 gap is if anything understated and 6's edge
+      # over 4 is flattered. The threads idle on the input queue once the
+      # initial scan is done, so this costs nothing during training.
+      #
+      # Worth raising ONLY here. The per-stage threads below feed a trainer
+      # that is GPU-bound at ~880 ms/step, so more of them buys no
+      # throughput, and shuffling_frame_sampler.reservoir_size_per_thread
+      # means extra sampler threads cost host memory outright.
+      threads: 4
       output {
         queue_capacity: 16
       }

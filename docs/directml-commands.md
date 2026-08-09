@@ -136,17 +136,22 @@ display driver produced a run that held 880 ms/step and *flat* GPU memory for
 2,000 steps:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\reset-gpu-state.ps1
+.venv-directml\Scripts\python.exe scripts\reset_gpu_state.py
 ```
 
-Then press **Ctrl+Shift+Win+B** — the screen blanks for a second and the
-display driver restarts. Which of the two actually does the work is not
-established: the shader cache is a few MB on disk and holds compiled shaders,
-not GPU allocations, so its size does not explain a memory symptom. The driver
-reset is the likelier half, because it reclaims allocations left behind by
-processes that died badly. A clean exit does return its own memory (the
-adapter drops from ~5,100 MB to ~1,200 MB), but a process killed mid-flight
-may not. Treat this as a remedy after crashes, not a ritual before every run.
+It clears both shader caches (`D3DSCache` and Intel's `ShaderCache`), sends
+Win+Ctrl+Shift+B to restart the display driver, and prints the GPU budget
+before and after. `--dry-run` shows what it would clear; `--no-driver-reset`
+skips the keystroke. It refuses to run while a trainer is up, because
+resetting the driver under a live DirectML context can lose the run.
+
+Which half actually does the work is not established: the caches are ~16 MB
+of compiled shaders on disk, not GPU allocations, so their size does not
+explain a memory symptom. The driver reset is the likelier half, because it
+reclaims allocations left behind by processes that died badly. A clean exit
+does return its own memory (the adapter drops from ~5,100 MB to ~1,200 MB),
+but a process killed mid-flight may not. Treat this as a remedy after
+crashes, not a ritual before every run.
 
 System RAM still matters for speed (thrashing slows steps: ~930 ms/step with
 3-4 GB free, ~4,400 ms with under 1.4 GB), just not for these crashes:
@@ -162,7 +167,39 @@ and charts `gpu_committed_mb` and `mem_available_gb` in TensorBoard.
 
 ---
 
-## 4. Evaluate by hand
+## 4. Startup time
+
+Every launch pays a data-loader startup before the first step, and the
+supervisor pays it again on each restart. One config value dominates it:
+`chunk_source_loader.threads`, which indexes the 345 tars across an 89 GB
+corpus. Measured to the first batch, loader only, no trainer:
+
+| `chunk_source_loader.threads` | time to first batch |
+|---|---|
+| 1 (the proto default) | 460 s |
+| **4 (now set)** | **117 s** |
+| 6 | 97 s |
+
+Timed in the order 4, 1, 6, so 4 had the coldest file cache and 6 the
+warmest — the 4-vs-1 gain is if anything understated, and 6's edge over 4 is
+flattered. 4 matches the machine's physical core count. The threads idle on
+the input queue once the scan is done, so this costs nothing while training.
+
+**Raise it only there.** The other stages feed a trainer that is GPU-bound at
+~880 ms/step, so more threads buy no throughput, and
+`shuffling_frame_sampler.reservoir_size_per_thread` means extra sampler
+threads cost host memory outright. `data_loader` is not part of the
+checkpoint digest, so changing any of this is safe mid-run.
+
+Time it yourself against a modified config:
+
+```powershell
+.venv-directml\Scripts\python.exe -c "import time; from google.protobuf import text_format; from lczero_training.dataloader import make_dataloader; from proto.root_config_pb2 import RootConfig; c=RootConfig(); text_format.Parse(open('docs/kda_split.textproto').read(), c); t=time.perf_counter(); l=make_dataloader(c.data_loader); l.get_next('train'); print(f'first batch after {time.perf_counter()-t:.1f}s'); l.stop()"
+```
+
+---
+
+## 5. Evaluate by hand
 
 Evaluation runs in a child process that exits, which is what returns its
 memory. It runs on the **CPU** by default and takes ~15 s for 50 batches; on
@@ -205,7 +242,7 @@ Remove-Item $env:TEMP\lc0-directml-eval-* -Recurse -Force
 
 ---
 
-## 5. Checkpoints and networks
+## 6. Checkpoints and networks
 
 Export a `.pb.gz` from the latest checkpoint by hand:
 
@@ -221,7 +258,7 @@ Start a checkpoint from an existing Leela network (only needed once):
 
 ---
 
-## 6. Tests
+## 7. Tests
 
 ```powershell
 .venv-directml\Scripts\python.exe -m pytest src\lczero_training -q
@@ -235,7 +272,7 @@ One file while working on it:
 
 ---
 
-## 7. Flags worth knowing
+## 8. Flags worth knowing
 
 Everything after the bare `--` goes to the trainer. Supervisor flags go
 **before** it — `--target-step` is read by the supervisor, which rewrites a
@@ -262,7 +299,7 @@ proactive restart. It refuses to start rather than let that happen.
 
 ---
 
-## 8. Gone wrong?
+## 9. Gone wrong?
 
 **Dashboard is blank / panels show `--`** — add `--io-dump dump.jsonl` to the
 TUI command and check whether payloads are arriving at all.
