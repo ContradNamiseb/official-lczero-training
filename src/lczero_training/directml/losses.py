@@ -384,7 +384,11 @@ class LczeroLoss:
 
 
 def materialize_metrics(
-    metrics: dict[str, torch.Tensor],
+    metrics: dict[str, torch.Tensor | float],
 ) -> dict[str, float]:
     """Pull metric tensors to the host. One sync, on reporting steps only."""
-    return {name: float(value) for name, value in metrics.items()}
+    return {
+        name: float(value) if isinstance(value, torch.Tensor) else float(value)
+        for name, value in metrics.items()
+    }
+

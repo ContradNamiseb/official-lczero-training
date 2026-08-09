@@ -99,34 +99,48 @@ Get-ChildItem C:\Users\Contrad\Documents\lc0-directml-checkpoint\checkpoint-*.pt
 
 ## 3. Is there room to train?
 
-The one number that decides throughput. Training needs about **5.5 GB
-resident** and cannot page, because GPU-shared memory has to stay resident.
-On this 11.65 GB machine that means everything else must fit in ~6 GB.
+**There are two memory pools and only one of them is the constraint.** Getting
+this wrong wastes a night: a run died reporting "Not enough memory resources
+are available" with **6.16 GB of system RAM free** and the process at 1.70 GB
+RSS. Both readings were true, because DirectML does not allocate from that
+pool.
+
+| pool | size here | who uses it |
+|---|---|---|
+| system RAM | 11.65 GB | everything; `psutil`, Task Manager |
+| **GPU shared memory** | **~5,965 MB — half of RAM, capped by WDDM** | **DirectML. This is the one that runs out** |
+
+The trainer needs ~5 GB of the second. Free RAM does not extend it, and
+closing non-GPU applications does not help.
+
+**The number that decides whether a run lives:**
 
 ```powershell
-Get-Process | Group-Object Name | ForEach-Object { [PSCustomObject]@{ Name=$_.Name; Count=$_.Count; TotalMB=[math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum/1MB) } } | Sort-Object TotalMB -Descending | Select-Object -First 10
+(Get-Counter "\GPU Adapter Memory(*)\Total Committed").CounterSamples | Measure-Object CookedValue -Sum | ForEach-Object { "GPU committed {0:N0} MB of ~5965 ({1:N0}%)" -f ($_.Sum/1MB), ($_.Sum/1MB/5965*100) }
 ```
+
+Who is holding it, by process:
+
+```powershell
+(Get-Counter "\GPU Process Memory(*)\Total Committed").CounterSamples | Where-Object { $_.CookedValue -gt 50MB } | Sort-Object CookedValue -Descending | Select-Object -First 8 @{n='MB';e={[math]::Round($_.CookedValue/1MB)}}, InstanceName
+```
+
+Measured at a real failure: adapter at **5,865 MB of 5,965 — 98%** — while
+6 GB of system RAM sat idle. The trainer's own share was 5,031 MB, and it
+dropped to ~1,280 MB the moment the process exited, which is the only way
+DirectML ever gives it back.
+
+System RAM still matters for speed (thrashing slows steps: ~930 ms/step with
+3-4 GB free, ~4,400 ms with under 1.4 GB), just not for these crashes:
 
 ```powershell
 $os = Get-CimInstance Win32_OperatingSystem; "available {0:N2} GB of {1:N2}" -f ($os.FreePhysicalMemory/1MB), ($os.TotalVisibleMemorySize/1MB)
 ```
 
-Measured on this machine, same config in every case:
-
-| available memory | ms/step |
-|---|---|
-| ~3-4 GB | **930** |
-| 1.5-2.8 GB | 3,810 |
-| 0.6-1.4 GB | 4,378 |
-
-Below roughly 1 GB it stops being slow and starts dying: three launches ended
-after 7, 9 and 27 steps. Closing the coding assistant returns ~1.3 GB, the
-webview processes and OneDrive another ~0.9 GB. No config value substitutes
-for this.
-
-The log now records `mem[available ...]` on every step line, warns below
-500 MB, and prints the memory state as the first line of any out-of-memory
-handler. `mem_available_gb` is charted in TensorBoard next to the losses.
+The log now records both on every step line — `mem[...]` for system RAM and
+`[gpu adapter N MB of ~5965 (P%)]` for the pool that matters — warns above
+92% of the cap, prints both as the first line of any out-of-memory handler,
+and charts `gpu_committed_mb` and `mem_available_gb` in TensorBoard.
 
 ---
 

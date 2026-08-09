@@ -829,3 +829,60 @@ def test_reported_metrics_average_over_the_micro_batches():
     assert reported == pytest.approx(sum(per_micro) / len(per_micro), rel=1e-4)
     # And it is genuinely an average, not just the final micro-batch.
     assert reported != pytest.approx(per_micro[-1], rel=1e-6)
+
+
+def test_accumulation_metrics_are_host_floats():
+    """Metrics accumulated across micro-batches must be host Python floats,
+    not device PyTorch tensors, preventing GPU allocation churn."""
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.training import train
+
+    config = _tiny_training_config()
+    config.training.gradient_accumulation_steps = 2
+    micro = _fixed_batches(2, 8, seed=42)
+
+    seen: list[dict] = []
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+    train(
+        config=config,
+        model=model,
+        optimizer=optimizer,
+        batches=iter(micro),
+        device=torch.device("cpu"),
+        start_step=0,
+        steps=1,
+        log_every=0,
+        reporters=[lambda step, scalars: seen.append(scalars)],
+        report_every=1,
+        diagnostics=True,
+    )
+
+    assert len(seen) == 1
+    scalars = seen[0]
+    for key, val in scalars.items():
+        assert isinstance(val, float), f"{key} must be a float, got {type(val)}"
+
+
+def test_release_to_host_clears_scratch_and_moves_tensors():
+    """release_to_host must free optimizer scratch and move parameters to CPU."""
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.training import release_to_host
+
+    config = _tiny_training_config()
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=0.0
+    )
+    # Populate scratch buffer
+    for p in model.parameters():
+        _ = optimizer._scratch_for(p)
+    assert len(optimizer._scratch) > 0
+
+    moved = release_to_host(model, optimizer)
+    assert len(optimizer._scratch) == 0
+    for p in model.parameters():
+        assert p.device.type == "cpu"
+

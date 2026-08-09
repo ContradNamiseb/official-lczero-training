@@ -267,7 +267,7 @@ training {
   # LESS often per unit of data. At 1 it runs 4x as often and the stranding
   # outruns the headroom. Fixing the optimizer to reuse buffers would remove
   # the constraint; until then 4 is load-bearing.
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
 }
 model {
   defaults {

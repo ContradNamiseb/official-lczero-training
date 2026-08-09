@@ -19,7 +19,7 @@ from proto.root_config_pb2 import RootConfig
 
 from . import checkpoint as checkpoint_io
 from . import derived_metrics
-from . import host_memory
+from . import gpu_memory, host_memory
 from .losses import LczeroLoss, materialize_metrics
 from .lr_schedule import make_lr_schedule
 from .metrics import Reporter
@@ -222,7 +222,7 @@ def train(
             group["lr"] = learning_rate
         optimizer.zero_grad(set_to_none=True)
 
-        metrics: dict[str, torch.Tensor] = {}
+        metrics: dict[str, float] = {}
         for micro in range(accumulation):
             final_micro = micro == accumulation - 1
             # Only the last micro-batch carries the diagnostics, so the KDA
@@ -256,12 +256,11 @@ def train(
             (loss / accumulation).backward()
 
             if should_log or should_report:
-                # Losses are summed across every micro-batch and divided
-                # below, so the reported value describes the whole
-                # effective batch rather than whichever one was last.
+                # Losses are converted to Python floats immediately to avoid
+                # device tensor allocation churn in the micro-batch loop.
                 for name, value in micro_metrics.items():
-                    prior = metrics.get(name)
-                    metrics[name] = value if prior is None else prior + value
+                    val_float = float(value)
+                    metrics[name] = metrics.get(name, 0.0) + val_float
 
             # Drop the activations before the next forward allocates. The
             # graph itself is freed by backward, but the output tensors are
@@ -274,7 +273,7 @@ def train(
 
         if metrics and accumulation > 1:
             for name in metrics:
-                metrics[name] = metrics[name] / accumulation
+                metrics[name] /= accumulation
 
         if (should_log or should_report) and diagnostics:
             # Once per step, on the last micro-batch's outputs -- not once
@@ -283,9 +282,12 @@ def train(
             # one micro-batch is the same estimate the run reported before
             # accumulation existed. Computing them 8x to average them cost
             # 8x the kernels and 8x the allocation churn.
-            metrics.update(
-                _diagnostic_metrics(predictions, batch, model, loss_fn)
+            diag_metrics = _diagnostic_metrics(
+                predictions, batch, model, loss_fn
             )
+            for name, value in diag_metrics.items():
+                metrics[name] = float(value)
+            del diag_metrics
         del predictions
 
         if max_grad_norm and max_grad_norm > 0:
@@ -317,13 +319,20 @@ def train(
             elapsed_so_far = time.perf_counter() - started
             scalars["ms_per_step"] = elapsed_so_far / (index + 1) * 1000.0
             # Charted alongside the losses on purpose. Whether a run died
-            # because the machine filled up or because the allocator stranded
-            # its heaps is the question every OOM here has turned on, and a
-            # trace that either falls steadily or sits flat until it drops
-            # answers it at a glance.
+            # because a pool filled up or because the allocator stranded its
+            # heaps is the question every OOM here has turned on, and a trace
+            # that climbs steadily answers it at a glance.
+            #
+            # Both pools, because they are not the same and confusing them
+            # cost a night: system RAM is what psutil sees, and gpu_committed
+            # is what DirectML actually allocates from. A run has died with
+            # 6 GB of the first free and 98% of the second gone.
             available = host_memory.available_gb()
             if available is not None:
                 scalars["mem_available_gb"] = available
+            committed = gpu_memory.adapter_committed_mb()
+            if committed is not None:
+                scalars["gpu_committed_mb"] = committed
 
             for reporter in reporters if should_report else ():
                 try:
@@ -338,10 +347,16 @@ def train(
                 f"{name}={value:.4f}"
                 for name, value in sorted(scalars.items())
                 if name
-                not in ("grad_norm", "lr", "ms_per_step", "mem_available_gb")
+                not in (
+                    "grad_norm",
+                    "lr",
+                    "ms_per_step",
+                    "mem_available_gb",
+                    "gpu_committed_mb",
+                )
             )
             logger.info(
-                "step %d  %s  grad_norm=%.4f  lr=%.3g  mem[%s]",
+                "step %d  %s  grad_norm=%.4f  lr=%.3g  mem[%s]  [%s]",
                 step,
                 detail,
                 float(grad_norm),
@@ -350,6 +365,7 @@ def train(
                 # the machine, not the model, and it is the number every
                 # out-of-memory post-mortem here has had to guess at.
                 host_memory.snapshot(),
+                gpu_memory.snapshot(),
             )
 
         # Everything the step still owns, dropped before the next forward
@@ -365,9 +381,10 @@ def train(
         # Every step, not on the logging cadence. log_every is a quarter of a
         # checkpoint interval -- 250 steps -- and the launches this exists to
         # explain died at steps 7, 9 and 27, so a warning gated on the log
-        # line would never have fired once. Reading one psutil counter is
-        # nothing against a ~900 ms step.
+        # line would never have fired once. One psutil counter and one warm
+        # PDH query, ~0.05 ms together, against a ~900 ms step.
         host_memory.warn_if_low(f"step {step}")
+        gpu_memory.warn_if_low(f"step {step}")
 
         if gc_every and step % gc_every == 0:
             # Reference counting frees a tensor the moment its last Python
@@ -456,6 +473,7 @@ def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
     # never comes.
     if optimizer is not None and hasattr(optimizer, "free_scratch"):
         optimizer.free_scratch()
+    gc.collect()
 
     moved = 0
     # keep_vars=True yields the Parameters and buffers themselves rather
@@ -481,6 +499,7 @@ def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
                 state[key] = value.detach().to("cpu")
                 moved += 1
 
+    gc.collect()
     logger.info("Released %d tensor(s) from the device to the host", moved)
     return moved
 

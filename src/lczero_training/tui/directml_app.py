@@ -547,9 +547,14 @@ class DirectMlTuiApp(App):
 
         for widget_id, widget_type, attribute, data in (
             ("#losses", LossPanel, "history", self._history),
-            ("#kda", KdaPanel, "blocks", self._blocks),
-            ("#policy", PolicyPanel, "scalars", self._scalars),
-            ("#optimizer", OptimizerPanel, "scalars", self._scalars),
+            (
+                "#kda",
+                KdaPanel,
+                "blocks",
+                {k: dict(v) for k, v in self._blocks.items()},
+            ),
+            ("#policy", PolicyPanel, "scalars", dict(self._scalars)),
+            ("#optimizer", OptimizerPanel, "scalars", dict(self._scalars)),
         ):
             widget = self.query_one(widget_id, widget_type)
             setattr(widget, attribute, data)

@@ -9,6 +9,7 @@ save after every steps_per_network steps until reaching that global step.
 """
 
 import argparse
+import contextlib
 import logging
 import sys
 
@@ -196,12 +197,14 @@ def main(argv: list[str] | None = None) -> int:
 
     from google.protobuf import text_format
 
+    import gc
     from lczero_training.dataloader import make_dataloader
     from lczero_training.directml import checkpoint as checkpoint_io
     from lczero_training.directml.training import (
         batches_from_loader,
         build_model_and_optimizer,
         make_checkpoint,
+        release_to_host,
         train,
         training_segments,
     )
@@ -387,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             logging.exception("Data loader failed to stop cleanly")
         metrics_sinks.close_all(reporters)
+        with contextlib.suppress(Exception):
+            release_to_host(model, optimizer)
+        gc.collect()
 
     if failed and final_step > restored.step:
         written = checkpoint_io.save(

@@ -15,6 +15,7 @@ this module reproduces Optax exactly.
 
 from __future__ import annotations
 
+import gc
 import fnmatch
 from collections.abc import Iterable, Iterator
 
@@ -110,6 +111,7 @@ class NAdamW(torch.optim.Optimizer):
         gives back is one the save no longer has to find.
         """
         self._scratch.clear()
+        gc.collect()
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
