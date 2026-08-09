@@ -85,6 +85,12 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+# Every venv variant, not just ".venv". The DirectML environment is
+# .venv-directml, which no rule here matched -- it was ignored only because
+# uv writes a .gitignore containing "*" inside each venv it creates. That
+# works until the file goes missing, at which point three gigabytes of
+# site-packages are offered up for commit.
+.venv*/
 env/
 venv/
 ENV/
@@ -120,6 +126,15 @@ subprojects/
 # Training run artifacts
 *.log
 daemon-io.jsonl
+# The headless supervisor parks the daemon's JSONL protocol stream in a .out
+# file, since with no TUI attached stdout is noise.
+*.out
+# Checkpoints, exported networks, and the eval worker's batch dumps. These
+# normally live outside the repo, but a run started with a relative --output
+# or a hand-run eval would drop them here.
+*.pt
+*.pb.gz
+*.npz
 
 # LLM Agents
 # Use AGENTS.md; symlink other files to it if needed.
