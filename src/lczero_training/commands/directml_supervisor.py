@@ -52,6 +52,7 @@ SUPERVISOR_FLAGS = (
     "--max-stalls",
     "--max-launches",
     "--backoff",
+    "--reset-gpu-state",
 )
 
 # The subset the daemon also understands. Repeating one of these after the
@@ -135,6 +136,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Seconds to wait after a launch that made no progress.",
+    )
+    parser.add_argument(
+        "--reset-gpu-state",
+        choices=("off", "cache", "full"),
+        default="full",
+        help=(
+            "Clear the shader caches, and with 'full' also restart the "
+            "display driver, before every launch. A restart is already the "
+            "only thing that returns DirectML memory; this makes it also "
+            "drop what the driver was still holding from a trainer that died "
+            "badly. 'full' is system-wide -- the screen blanks for a moment "
+            "and every GPU application on the machine has its device reset -- "
+            "which is fine between launches and is why it never runs during "
+            "one. 'cache' skips the keystroke; 'off' does nothing."
+        ),
     )
     return parser
 
@@ -369,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     from lczero_training.directml import checkpoint as checkpoint_io
+    from lczero_training.directml import gpu_reset
 
     directory = _checkpoint_directory(args.config, args.checkpoint)
     step = checkpoint_io.latest_step(directory)
@@ -419,6 +436,11 @@ def main(argv: list[str] | None = None) -> int:
                 child_target,
                 args.target_step,
             )
+            # Here, and not inside the daemon: this is the one moment nothing
+            # of ours holds a device, because the previous child has already
+            # exited and the next has not started. A driver reset is
+            # system-wide and would take a live run down with it.
+            gpu_reset.reset(args.reset_gpu_state)
             try:
                 code = _run_daemon(command, job)
             except KeyboardInterrupt:

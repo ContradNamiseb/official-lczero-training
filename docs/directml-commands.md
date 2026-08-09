@@ -130,20 +130,33 @@ Measured at a real failure: adapter at **5,865 MB of 5,965 — 98%** — while
 dropped to ~1,280 MB the moment the process exited, which is the only way
 DirectML ever gives it back.
 
-**If runs have been crashing, reset the GPU state before the next one.**
-After a morning of failures, clearing the D3D shader cache and restarting the
+**The supervisor resets the GPU state before every launch, automatically.**
+After a morning of failures, clearing the shader caches and restarting the
 display driver produced a run that held 880 ms/step and *flat* GPU memory for
-2,000 steps:
+2,000 steps — so it is now part of the restart cycle rather than something to
+remember. Controlled by `--reset-gpu-state`:
+
+| value | what happens before each launch |
+|---|---|
+| `full` (default) | clear both shader caches **and** restart the display driver |
+| `cache` | clear the caches only, no keystroke |
+| `off` | nothing |
+
+It runs at the one moment nothing of ours holds a device — the previous child
+has exited, the next has not started — because a driver reset is system-wide:
+the screen blanks for a moment and every GPU application on the machine has
+its device reset. That is fine between launches and would not be fine during
+one. A reset that fails is logged and the launch proceeds anyway.
+
+For the paths with no supervisor (`directml_train`, a plain TUI run, or
+tidying up after something died):
 
 ```powershell
 .venv-directml\Scripts\python.exe scripts\reset_gpu_state.py
 ```
 
-It clears both shader caches (`D3DSCache` and Intel's `ShaderCache`), sends
-Win+Ctrl+Shift+B to restart the display driver, and prints the GPU budget
-before and after. `--dry-run` shows what it would clear; `--no-driver-reset`
-skips the keystroke. It refuses to run while a trainer is up, because
-resetting the driver under a live DirectML context can lose the run.
+Same logic, plus a check that no trainer is running. `--dry-run` shows what it
+would clear; `--no-driver-reset` skips the keystroke.
 
 Which half actually does the work is not established: the caches are ~16 MB
 of compiled shaders on disk, not GPU allocations, so their size does not
@@ -285,6 +298,7 @@ proactive restart. It refuses to start rather than let that happen.
 | `--restart-every N` | steps per launch before a planned restart (default 15000). `0` restarts only after a crash |
 | `--max-launches N` | stop after N launches even while making progress. `0` = only `--target-step` ends it |
 | `--max-stalls N` | give up after N launches that advance nothing (default 3) |
+| `--reset-gpu-state M` | `full` (default) clears the shader caches and restarts the display driver before each launch; `cache` skips the keystroke; `off` does nothing. See §3 |
 
 | trainer flag | what it does |
 |---|---|
