@@ -86,14 +86,18 @@ def _safe_softmax_cross_entropy(
     """As above, but tolerating -inf logits.
 
     Masked-out moves carry -inf, whose log_softmax contribution is
-    ``0 * -inf = nan``. Every masked position has a zero label, so the term
-    is mathematically zero; substitute it explicitly rather than letting the
-    nan propagate (this is what optax.safe_softmax_cross_entropy does).
+    ``0 * -inf = nan``. Substituting negative infinity with a finite large
+    negative logit (-1e9) ensures log_softmax and backward gradients stay
+    finite and exact zero.
     """
-    log_probs = torch.log_softmax(logits, dim=-1)
-    contributions = labels * log_probs
+    safe_logits = torch.where(
+        torch.isinf(logits) & (logits < 0),
+        torch.full_like(logits, -1e9),
+        logits,
+    )
+    log_probs = torch.log_softmax(safe_logits, dim=-1)
     contributions = torch.where(
-        labels > 0, contributions, torch.zeros_like(contributions)
+        labels > 0, labels * log_probs, torch.zeros_like(safe_logits)
     )
     return -contributions.sum(dim=-1)
 
@@ -185,7 +189,8 @@ class PolicyLoss:
         predicted_q = _q_from_wdl(wdl_logits)
         target_q = batch.values[:, self.opt_value_type, 0]
         sigma = torch.sqrt(error_pred.squeeze(-1).clamp_min(0.0))
-        z = (target_q - predicted_q) / (sigma + self.opt_eps)
+        eps = self.opt_eps if self.opt_eps > 0 else 1e-6
+        z = (target_q - predicted_q) / (sigma + eps)
         return torch.sigmoid((z - self.opt_strength) * self.opt_alpha)
 
 

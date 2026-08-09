@@ -902,3 +902,25 @@ def test_release_to_host_clears_scratch_and_moves_tensors():
     assert len(optimizer._scratch) == 0
     for p in model.parameters():
         assert p.device.type == "cpu"
+
+
+def test_safe_softmax_cross_entropy_handles_negative_infinities_without_nan_gradient():
+    """_safe_softmax_cross_entropy must not produce NaN gradients on -inf logits or all -inf rows."""
+    from lczero_training.directml.losses import _safe_softmax_cross_entropy
+
+    # Case 1: logits has -inf for masked moves, valid positive target present
+    logits1 = torch.tensor([[2.0, float("-inf"), -1.0]], requires_grad=True)
+    labels1 = torch.tensor([[1.0, 0.0, 0.0]])
+    loss1 = _safe_softmax_cross_entropy(logits1, labels1)
+    loss1.backward()
+    assert logits1.grad is not None
+    assert not torch.isnan(logits1.grad).any()
+
+    # Case 2: all logits are -inf (e.g. no valid legal moves in position)
+    logits2 = torch.tensor([[float("-inf"), float("-inf")]], requires_grad=True)
+    labels2 = torch.tensor([[0.0, 0.0]])
+    loss2 = _safe_softmax_cross_entropy(logits2, labels2)
+    loss2.backward()
+    assert logits2.grad is not None
+    assert not torch.isnan(logits2.grad).any()
+
