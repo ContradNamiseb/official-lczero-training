@@ -53,6 +53,7 @@ class DirectMlTrainingDaemon:
         data_phase_step_interval: Optional[int] = None,
         gc_every: int = 0,
         nan_check: str = "report",
+        max_skips: int = 20,
     ):
         self._config_filepath = config_filepath
         self._checkpoint_dir = checkpoint_dir
@@ -71,6 +72,7 @@ class DirectMlTrainingDaemon:
         self._data_phase_step_interval = data_phase_step_interval
         self._gc_every = gc_every
         self._nan_check = nan_check
+        self._max_skips = max_skips
 
         self._stop = threading.Event()
         self._communicator = Communicator(self, sys.stdin, sys.stdout)
@@ -539,6 +541,7 @@ class DirectMlTrainingDaemon:
                     eval_every=self._eval_every,
                     gc_every=self._gc_every,
                     nan_check=self._nan_check,
+                    max_skips=self._max_skips,
                 )
                 self._emit(
                     phase=TrainingPhase.SAVING.value,

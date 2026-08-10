@@ -158,6 +158,140 @@ def test_the_error_carries_the_step_and_the_detail():
     )
 
 
+# --- skip mode: ride through a bad batch rather than crash-loop ------------
+
+
+def _skip_mode_setup(monkeypatch, bad_steps):
+    """A tiny real train() run whose Nth clip returns a non-finite norm.
+
+    Drives the guard branch through the actual training loop rather than a
+    mock, but forces the non-finite gradient deterministically instead of
+    hunting for a batch that explodes.
+    """
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.optimizer import NAdamW
+    from lczero_training.directml.test_training import (
+        _fixed_batches,
+        _tiny_training_config,
+    )
+
+    config = _tiny_training_config()
+    config.training.max_grad_norm = 1.0  # use the clip path
+    torch.manual_seed(0)
+    model = LczeroModel(config.model)
+    optimizer = NAdamW(
+        [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=1e-4
+    )
+
+    real_clip = torch.nn.utils.clip_grad_norm_
+    call = {"n": 0}
+
+    def fake_clip(params, max_norm, *args, **kwargs):
+        call["n"] += 1
+        norm = real_clip(list(params), max_norm, *args, **kwargs)
+        if call["n"] in bad_steps:
+            return torch.tensor(float("inf"))
+        return norm
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", fake_clip)
+
+    applied = {"n": 0}
+    real_step = optimizer.step
+
+    def counting_step(*args, **kwargs):
+        applied["n"] += 1
+        return real_step(*args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "step", counting_step)
+    return config, model, optimizer, applied
+
+
+def test_skip_mode_rides_through_a_bad_gradient(monkeypatch):
+    """The whole point: one exploding step costs a skipped update, not a
+    crash. The run that motivated this hit reliable spikes in one region
+    and a plain restart could not get past them."""
+    from lczero_training.directml.test_training import _fixed_batches
+    from lczero_training.directml.training import train
+
+    config, model, optimizer, applied = _skip_mode_setup(
+        monkeypatch, bad_steps={2}
+    )
+
+    final = train(
+        config=config,
+        model=model,
+        optimizer=optimizer,
+        batches=iter(_fixed_batches(4, 4, seed=1)),
+        device=torch.device("cpu"),
+        start_step=0,
+        steps=4,
+        log_every=0,
+        diagnostics=False,
+        nan_check="skip",
+    )
+
+    assert final == 4, "the run must reach the end, not stop at the bad step"
+    assert applied["n"] == 3, (
+        "the bad step's update must be skipped, the other three applied"
+    )
+    assert torch.isfinite(
+        torch.cat([p.flatten() for p in model.parameters()])
+    ).all(), "skipping the update must leave the weights finite"
+
+
+def test_report_mode_still_stops_on_a_bad_gradient(monkeypatch):
+    """The default is unchanged: a divergence should stop and be seen."""
+    from lczero_training.directml.test_training import _fixed_batches
+    from lczero_training.directml.training import train
+
+    config, model, optimizer, _ = _skip_mode_setup(monkeypatch, bad_steps={2})
+
+    # A reporter, because "report" mode checks on the reporting cadence and
+    # the cadence only fires when something is listening -- which in a real
+    # run is always true (the TUI callback and TensorBoard both attach).
+    with pytest.raises(NonFiniteGradientError):
+        train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=iter(_fixed_batches(4, 4, seed=1)),
+            device=torch.device("cpu"),
+            start_step=0,
+            steps=4,
+            log_every=0,
+            reporters=[lambda step, scalars: None],
+            report_every=1,
+            diagnostics=False,
+            nan_check="report",
+        )
+
+
+def test_skip_mode_gives_up_once_it_is_clearly_divergence(monkeypatch):
+    """A flood of skips is not a bad batch. Stopping lets the checkpoint
+    guard roll back rather than skipping forever on dead weights."""
+    from lczero_training.directml.test_training import _fixed_batches
+    from lczero_training.directml.training import train
+
+    config, model, optimizer, _ = _skip_mode_setup(
+        monkeypatch, bad_steps={1, 2, 3, 4, 5, 6}
+    )
+
+    with pytest.raises(NonFiniteGradientError, match="max-skips"):
+        train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=iter(_fixed_batches(6, 4, seed=1)),
+            device=torch.device("cpu"),
+            start_step=0,
+            steps=6,
+            log_every=0,
+            diagnostics=False,
+            nan_check="skip",
+            max_skips=3,
+        )
+
+
 def test_the_emergency_save_declines_a_poisoned_model(tmp_path, caplog):
     """After the guard fires, the recovery save must not try to write the
     dead weights, and must point at the checkpoint that is still good."""

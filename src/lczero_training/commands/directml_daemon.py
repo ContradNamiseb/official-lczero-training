@@ -84,15 +84,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--nan-check",
-        choices=("report", "step", "off"),
+        choices=("report", "step", "skip", "off"),
         default="report",
         help=(
-            "Stop on a non-finite gradient instead of letting the optimizer "
-            "turn it into non-finite weights. 'report' checks on the "
-            "reporting cadence and adds no device sync of its own; 'step' "
-            "checks every step to name the exact one, measured at +7%% on a "
-            "518 ms step; 'off' disables it. Checkpoints are refused when "
-            "the weights are non-finite regardless of this setting."
+            "What to do about a non-finite gradient, which the optimizer "
+            "would turn into non-finite weights. 'report' checks on the "
+            "reporting cadence, no extra sync, and stops the run; 'step' "
+            "checks every step (+7%% on a 518 ms step) and stops on the "
+            "exact one; 'skip' checks every step but drops the bad gradient "
+            "and keeps training, for an unattended run through a rough patch; "
+            "'off' disables it. Checkpoints are refused when the weights are "
+            "non-finite regardless of this setting."
+        ),
+    )
+    parser.add_argument(
+        "--max-skips",
+        type=int,
+        default=20,
+        help=(
+            "With --nan-check skip, give up after this many skipped updates. "
+            "A few is a bad batch; a flood is a diverged run that skipping "
+            "cannot rescue, and stopping lets the checkpoint guard roll back."
         ),
     )
     parser.add_argument(
@@ -167,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         data_phase_step_interval=args.data_phase_step_interval,
         gc_every=args.gc_every,
         nan_check=args.nan_check,
+        max_skips=args.max_skips,
     )
     return daemon.run()
 

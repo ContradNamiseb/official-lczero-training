@@ -180,6 +180,7 @@ def train(
     eval_every: int = 0,
     gc_every: int = 0,
     nan_check: str = "report",
+    max_skips: int = 20,
 ) -> int:
     """Run `steps` optimizer steps. Returns the resulting global step.
 
@@ -187,10 +188,14 @@ def train(
     TensorBoard and the TUI daemon both hook in this way. Metrics are only
     pulled off the device on steps that actually report.
 
-    ``nan_check`` stops the run on a non-finite gradient rather than letting
-    the optimizer turn it into non-finite weights. ``"report"`` (default)
-    checks on the reporting cadence and adds no sync of its own; ``"step"``
-    checks every step for +7% and names the exact one; ``"off"`` disables it.
+    ``nan_check`` governs what happens on a non-finite gradient, which the
+    optimizer would otherwise turn into non-finite weights. ``"report"``
+    (default) checks on the reporting cadence and adds no sync of its own,
+    stopping the run; ``"step"`` checks every step for +7% and stops on the
+    exact one; ``"skip"`` also checks every step but drops the bad gradient
+    and continues, giving up only after ``max_skips`` skips; ``"off"``
+    disables it. ``"skip"`` is for an unattended run through a rough patch;
+    ``"report"`` is right when a diverged run should stop and be looked at.
 
     ``eval_hook`` fires on global steps divisible by ``eval_every``, so the
     cadence is the same whether this is called once for 20,000 steps or
@@ -212,6 +217,7 @@ def train(
     step = start_step
     started: float | None = None
     warmup_seconds = 0.0
+    skipped_steps = 0
     for index in range(steps):
         # Decided before the forward pass, since the KDA stats are captured
         # during it. Anything that reports needs them; the other steps run
@@ -328,13 +334,46 @@ def train(
         # checkpoint_io.save refuses to persist them and a diverged run is
         # rolled back to the last checkpoint either way. "step" pays the 7%
         # to catch the exact step, which is what to use when hunting one.
-        if nan_check == "step" or (
+        # "skip" also checks every step, but rather than stopping it drops
+        # the bad gradient and carries on: a rare exploding batch then costs
+        # one skipped update instead of a crash-and-restart loop. This model
+        # hit reliable data-triggered spikes in one step region that a plain
+        # restart could not get past, because every relaunch walked back into
+        # the same batches; skipping rides through them.
+        apply_update = True
+        if nan_check in ("step", "skip") or (
             nan_check == "report" and (should_log or should_report)
         ):
             if not bool(torch.isfinite(grad_norm)):
-                raise NonFiniteGradientError(step, describe_non_finite(model))
+                if nan_check == "skip":
+                    apply_update = False
+                    skipped_steps += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    logger.warning(
+                        "Non-finite gradient at step %d; skipping this "
+                        "update and continuing (%d skipped so far). %s",
+                        step,
+                        skipped_steps,
+                        describe_non_finite(model),
+                    )
+                    if skipped_steps > max_skips > 0:
+                        # A handful of skips is a bad batch; a flood is a
+                        # diverged run that skipping cannot rescue, and
+                        # looping forever hides that. Stop and let the guard
+                        # roll back to the last good checkpoint.
+                        raise NonFiniteGradientError(
+                            step,
+                            f"{skipped_steps} skipped updates exceeds "
+                            f"--max-skips={max_skips}; this is divergence, "
+                            f"not a bad batch. {describe_non_finite(model)}",
+                        )
+                else:
+                    raise NonFiniteGradientError(
+                        step, describe_non_finite(model)
+                    )
 
-        optimizer.step()
+        if apply_update:
+            optimizer.step()
         step += 1
         if progress is not None:
             # Published every step so a caller that catches an exception
@@ -459,6 +498,12 @@ def train(
             elapsed / steps * 1000.0,
             accumulation,
             warmup_seconds,
+        )
+    if skipped_steps:
+        logger.warning(
+            "Skipped %d non-finite update(s) this segment; the run rode "
+            "through them rather than diverging",
+            skipped_steps,
         )
     return step
 

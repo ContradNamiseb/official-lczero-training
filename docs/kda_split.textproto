@@ -261,7 +261,15 @@ training {
       weight: 1.0
     }
   }
-  max_grad_norm: 16.0
+  # 8.0, down from 16.0. Steady-state gradient norm here is ~5-6 and a
+  # survivable spike to 11 was seen, so 8 leaves normal steps untouched while
+  # firmly catching the larger spikes that 16 let through -- one of which
+  # overflowed to NaN on the next step and stalled training in the 212k-224k
+  # region for a full day. Deliberately not lower: 4 would clip most normal
+  # steps and quietly slow learning. Not part of the checkpoint digest, so it
+  # is safe to change mid-run. Pair it with --nan-check skip, which drops any
+  # gradient that is already non-finite before the clip can see it.
+  max_grad_norm: 8.0
   # Batch 32 is the hard memory ceiling for this model on the Iris Xe (48
   # already OOMs), so the effective batch is bought with accumulation
   # instead, at the peak memory of a single 32.
