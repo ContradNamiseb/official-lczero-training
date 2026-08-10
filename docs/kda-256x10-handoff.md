@@ -1,4 +1,4 @@
-# KDA 256x10 — running the ablation on 4x A100
+# KDA 256x10
 
 Everything needed to train this architecture on someone else's hardware.
 The config is [kda_256x10_a100.textproto](kda_256x10_a100.textproto).
@@ -15,14 +15,14 @@ hardware you do not have. This config is for the JAX/CUDA trainer.
 Kimi Delta Attention as a sequence mixer over the 64 squares, in place of
 most of the attention blocks.
 
-| | |
-|---|---|
-| tower | 10 encoder blocks, `d_model` 256, `dff` 256 |
-| mixer pattern | `[KDA, KDA, KDA, MHA]` tiled → **8 KDA, 2 MHA** |
-| heads | 16 |
-| KDA | `key_dim` 32, `value_dim` 32, `gate_rank` 64 |
-| board scan | 8 directions — rank/file/diagonal/anti-diagonal, each way |
-| parameters | **14,866,540** (verified by building it) |
+|               |                                                           |
+| ------------- | --------------------------------------------------------- |
+| tower         | 10 encoder blocks, `d_model` 256, `dff` 256               |
+| mixer pattern | `[KDA, KDA, KDA, MHA]` tiled → **8 KDA, 2 MHA**           |
+| heads         | 16                                                        |
+| KDA           | `key_dim` 32, `value_dim` 32, `gate_rank` 64              |
+| board scan    | 8 directions — rank/file/diagonal/anti-diagonal, each way |
+| parameters    | **14,866,540** (verified by building it)                  |
 
 Each KDA block runs a gated delta-rule recurrence along the board in 8
 directions, 2 heads per direction, instead of all-pairs attention. The two
@@ -44,13 +44,13 @@ else is Python.
 
 Open the config and search for **`CHANGEME`**. Five paths:
 
-| field | what |
-|---|---|
+| field                                               | what                              |
+| --------------------------------------------------- | --------------------------------- |
 | `data_loader.stage[0].file_path_provider.directory` | directory of `.tar` training data |
-| `training.checkpoint.path` | where checkpoints go |
-| `metrics.tensorboard_path` | TensorBoard logdir |
-| `export.destination_filename` | exported `.pb.gz` networks |
-| `chunk_rescorer.syzygy_paths` | optional, commented out |
+| `training.checkpoint.path`                          | where checkpoints go              |
+| `metrics.tensorboard_path`                          | TensorBoard logdir                |
+| `export.destination_filename`                       | exported `.pb.gz` networks        |
+| `chunk_rescorer.syzygy_paths`                       | optional, commented out           |
 
 **Then fix `chunk_pool_size` (two places).** It is a sampling *window*, not a
 buffer: the pool draws from the last N chunks it has seen, so anything below
@@ -131,10 +131,3 @@ The KDA-specific health metrics are `KDA/blockN decay saturated %` and
 the recurrence is forgetting everything and the block has collapsed toward a
 pointwise MLP — worth reporting even if the loss curve looks fine, because
 it changes what the comparison means.
-
-## Known-unverified
-
-No lc0 binary has yet loaded a network exported by this pipeline. Export
-round-trips through this repo's own importer and the weight layout matches
-the reference, but the end-to-end check is outstanding. Worth doing early
-with a small export before spending 13 hours on a run.

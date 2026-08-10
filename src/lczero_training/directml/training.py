@@ -179,12 +179,18 @@ def train(
     eval_hook: "Callable[[int], None] | None" = None,
     eval_every: int = 0,
     gc_every: int = 0,
+    nan_check: str = "report",
 ) -> int:
     """Run `steps` optimizer steps. Returns the resulting global step.
 
     ``reporters`` receive ``(step, scalars)`` every ``report_every`` steps --
     TensorBoard and the TUI daemon both hook in this way. Metrics are only
     pulled off the device on steps that actually report.
+
+    ``nan_check`` stops the run on a non-finite gradient rather than letting
+    the optimizer turn it into non-finite weights. ``"report"`` (default)
+    checks on the reporting cadence and adds no sync of its own; ``"step"``
+    checks every step for +7% and names the exact one; ``"off"`` disables it.
 
     ``eval_hook`` fires on global steps divisible by ``eval_every``, so the
     cadence is the same whether this is called once for 20,000 steps or
@@ -302,6 +308,31 @@ def train(
                     if p.grad is not None
                 )
             )
+
+        # The last point at which the weights are still good. A non-finite
+        # gradient here becomes a non-finite parameter the instant
+        # optimizer.step() runs, and there is no recovering from that: a real
+        # run went from a healthy step to every one of 153 tensors being NaN
+        # inside a single 250-step window, then trained on for three hours
+        # producing nothing.
+        #
+        # Clipping does not help. clip_grad_norm_ scales by
+        # max_norm/total_norm, and with a NaN total_norm every gradient comes
+        # out NaN -- max_grad_norm was set to 16.0 throughout that run.
+        #
+        # Checking costs a device-to-host sync, which the rest of this loop
+        # is careful to avoid: measured at +37 ms on a 518 ms step, +7.2%.
+        # So "report" is the default and piggybacks the sync the reporting
+        # path already performs -- the weights can then be poisoned for up
+        # to report_every steps, which costs nothing that matters, because
+        # checkpoint_io.save refuses to persist them and a diverged run is
+        # rolled back to the last checkpoint either way. "step" pays the 7%
+        # to catch the exact step, which is what to use when hunting one.
+        if nan_check == "step" or (
+            nan_check == "report" and (should_log or should_report)
+        ):
+            if not bool(torch.isfinite(grad_norm)):
+                raise NonFiniteGradientError(step, describe_non_finite(model))
 
         optimizer.step()
         step += 1
@@ -442,6 +473,55 @@ def build_model_and_optimizer(
         learning_rate=constant_learning_rate(config.training.lr_schedule),
     )
     return model, optimizer
+
+
+class NonFiniteGradientError(RuntimeError):
+    """A gradient went NaN or infinite before it could reach the weights."""
+
+    def __init__(self, step: int, detail: str):
+        self.step = step
+        self.detail = detail
+        super().__init__(
+            f"non-finite gradient at step {step}, stopping before the "
+            f"optimizer applies it. {detail}"
+        )
+
+
+def describe_non_finite(model: LczeroModel, limit: int = 6) -> str:
+    """Which parameters and gradients are bad, for the failure message.
+
+    Only ever called once, on the way out, so the cost does not matter --
+    and this is the evidence that was missing when a run diverged twice
+    with nothing in the log but `total=nan` a quarter of an hour later.
+    Distinguishing bad *gradients* over good *weights* from both being bad
+    says whether this step caused it or an earlier one did.
+    """
+    bad_params: list[str] = []
+    bad_grads: list[str] = []
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if not torch.isfinite(param).all():
+                bad_params.append(name)
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                bad_grads.append(name)
+
+    def summarise(names: list[str], what: str) -> str:
+        if not names:
+            return f"no non-finite {what}"
+        shown = ", ".join(names[:limit])
+        more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
+        return f"{len(names)} non-finite {what}: {shown}{more}"
+
+    weights_ok = not bad_params
+    return (
+        f"{summarise(bad_grads, 'gradients')}; "
+        f"{summarise(bad_params, 'weights')}."
+        + (
+            " The weights are still good, so this step is the origin."
+            if weights_ok
+            else " The weights are already bad, so the origin is earlier."
+        )
+    )
 
 
 def describe_error(error: BaseException) -> str:

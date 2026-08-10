@@ -323,6 +323,27 @@ few steps of starting, the machine is full; if it fails thousands of steps in,
 that is the DirectML allocator and a restart is the cure, which is what
 `--supervise` automates.
 
+**`non-finite gradient at step N`** — the run diverged and stopped itself
+before the optimizer could write NaN into the weights. The message names the
+first bad gradients and says whether the weights were still clean, which
+tells you if that step was the origin or an earlier one was.
+
+Resume from the last checkpoint; it is guaranteed good, because
+`checkpoint_io.save` refuses to write non-finite weights. Before this guard
+existed a run diverged, carried on for three hours producing nothing, and
+wrote six NaN checkpoints — with `max_to_keep` rotating the directory, the
+last clean weights came within four writes of being deleted.
+
+Check what is on disk before resuming:
+
+```powershell
+.venv-directml\Scripts\python.exe -c "import torch,glob,os; [print(os.path.basename(f), 'NaN' if any(torch.is_tensor(v) and not torch.isfinite(v).all() for v in torch.load(f,map_location='cpu',weights_only=False)['model_state'].values()) else 'clean') for f in sorted(glob.glob('C:/Users/Contrad/Documents/lc0-directml-checkpoint/checkpoint-*.pt'))]"
+```
+
+If it happens repeatedly, run with `--nan-check step` to catch the exact
+step rather than the reporting window. It costs ~7% throughput (measured:
++37 ms on a 518 ms step), which is why `report` is the default.
+
 **A run stopped and the last line mentions an evaluation** — it is not stuck.
 The trainer waits up to `--eval-timeout`, skips the evaluation, and carries on.
 No steps are lost.

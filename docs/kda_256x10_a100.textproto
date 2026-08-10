@@ -1,4 +1,4 @@
-# KDA 256x10 on 4x A100 -- an ablation-comparable config.
+# KDA 256x10
 #
 # This is the JAX/CUDA trainer (lc0-train / lc0-tui), NOT the DirectML port.
 # The DirectML work in this repo is a Windows/iGPU path and none of its

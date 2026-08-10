@@ -52,6 +52,7 @@ class DirectMlTrainingDaemon:
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
         gc_every: int = 0,
+        nan_check: str = "report",
     ):
         self._config_filepath = config_filepath
         self._checkpoint_dir = checkpoint_dir
@@ -69,6 +70,7 @@ class DirectMlTrainingDaemon:
         self._data_file_count = data_file_count
         self._data_phase_step_interval = data_phase_step_interval
         self._gc_every = gc_every
+        self._nan_check = nan_check
 
         self._stop = threading.Event()
         self._communicator = Communicator(self, sys.stdin, sys.stdout)
@@ -187,6 +189,23 @@ class DirectMlTrainingDaemon:
                 "recovery checkpoint at step %d; saving anyway",
                 step,
             )
+
+        # Nothing below can help if the weights are already gone. Retrying
+        # without the optimizer state, or reporting "progress is lost", would
+        # both be noise: the run diverged, and the last scheduled checkpoint
+        # is the recovery point. Saying so plainly is the useful outcome.
+        poisoned = checkpoint_io.first_non_finite(model.state_dict())
+        if poisoned is not None:
+            logger.error(
+                "Not writing a recovery checkpoint at step %d: the weights "
+                "are not finite (%s). The last good checkpoint in %s is "
+                "intact -- resume from it. Steps since then are lost, and "
+                "were not trainable anyway.",
+                step,
+                poisoned,
+                directory,
+            )
+            return
 
         def attempt(with_optimizer: bool) -> bool:
             try:
@@ -519,6 +538,7 @@ class DirectMlTrainingDaemon:
                     eval_hook=eval_hook,
                     eval_every=self._eval_every,
                     gc_every=self._gc_every,
+                    nan_check=self._nan_check,
                 )
                 self._emit(
                     phase=TrainingPhase.SAVING.value,

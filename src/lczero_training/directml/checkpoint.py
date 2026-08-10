@@ -83,14 +83,53 @@ def _checkpoint_files(
     return sorted(found)
 
 
+class NonFiniteWeightsError(RuntimeError):
+    """Raised rather than write a checkpoint whose weights are not finite."""
+
+
+def first_non_finite(state: dict[str, Any]) -> str | None:
+    """Name of the first tensor holding a NaN or an infinity, or None."""
+    import torch
+
+    for name, tensor in state.items():
+        if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            continue
+        if not torch.isfinite(tensor).all():
+            return name
+    return None
+
+
 def save(
     directory: str | os.PathLike,
     checkpoint: Checkpoint,
     *,
     max_to_keep: int = 0,
+    require_finite: bool = True,
 ) -> pathlib.Path:
-    """Write a checkpoint atomically. Returns the path written."""
+    """Write a checkpoint atomically. Returns the path written.
+
+    Refuses a checkpoint whose weights are not finite. A real run diverged
+    and then wrote six NaN checkpoints over the following three hours; with
+    ``max_to_keep`` rotating the directory, each one deleted an older good
+    checkpoint, and the last clean weights came within four writes of being
+    destroyed. Nothing downstream can recover from a NaN checkpoint, so
+    writing one is never the right outcome -- refusing costs a stopped run
+    and saves the only weights worth having.
+
+    Checked here rather than at the call sites because every path that
+    persists weights goes through this function, including the emergency
+    save on a crash, which is exactly when the weights are least trustworthy.
+    """
     import torch
+
+    if require_finite:
+        poisoned = first_non_finite(checkpoint.model_state)
+        if poisoned is not None:
+            raise NonFiniteWeightsError(
+                f"refusing to write a checkpoint at step {checkpoint.step}: "
+                f"{poisoned} is not finite. The last good checkpoint in "
+                f"{directory} is left untouched."
+            )
 
     path = pathlib.Path(directory)
     path.mkdir(parents=True, exist_ok=True)

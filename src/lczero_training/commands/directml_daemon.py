@@ -83,6 +83,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--nan-check",
+        choices=("report", "step", "off"),
+        default="report",
+        help=(
+            "Stop on a non-finite gradient instead of letting the optimizer "
+            "turn it into non-finite weights. 'report' checks on the "
+            "reporting cadence and adds no device sync of its own; 'step' "
+            "checks every step to name the exact one, measured at +7%% on a "
+            "518 ms step; 'off' disables it. Checkpoints are refused when "
+            "the weights are non-finite regardless of this setting."
+        ),
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=0,
@@ -153,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         data_file_count=args.data_file_count,
         data_phase_step_interval=args.data_phase_step_interval,
         gc_every=args.gc_every,
+        nan_check=args.nan_check,
     )
     return daemon.run()
 
