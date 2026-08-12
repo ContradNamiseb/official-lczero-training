@@ -130,6 +130,35 @@ def run_smoke_tests(device: torch.device) -> list[SmokeResult]:
         assert x.grad is not None
         return f"finite={bool(torch.isfinite(x.grad).all().cpu())}"
 
+    def softplus_extreme_input() -> str:
+        # Small random inputs (the check above) pass on every backend and
+        # would never have caught this: DirectML's softplus backward is not
+        # the standard branch-on-sign-stable sigmoid(x). Verified against
+        # the CPU backend, it returns 0 (not ~1) past x~88 and NaN past
+        # x~89, instead of the correct ~1 either side -- consistent with a
+        # kernel that computes 1/(1+exp(x)) unconditionally, overflowing
+        # exp(x) right where float32 does. This silently corrupted a real
+        # training run's moves-left head gradient with nothing else in the
+        # step non-finite anywhere describe_non_finite could see -- see
+        # layers.SOFTPLUS_SAFE_MAX and layers.mish, which now clamp their
+        # way around it. If this check ever starts failing, that means
+        # torch_directml changed and the clamp workaround needs revisiting,
+        # not that it needs to exist in the first place.
+        x = torch.tensor([200.0], device=device, requires_grad=True)
+        torch.nn.functional.softplus(x).backward()
+        assert x.grad is not None
+        grad = float(x.grad.cpu())
+        # Not just reported: the other checks in this file only assert
+        # `is not None` and leave "finite=True/False" for a human to
+        # notice, but a workaround this specific deserves an automated
+        # tripwire rather than a string someone has to read.
+        assert abs(grad - 1.0) < 1e-3, (
+            f"softplus backward at x=200 gave grad={grad}, expected ~1.0 -- "
+            "either DirectML's kernel changed or layers.SOFTPLUS_SAFE_MAX "
+            "needs revisiting"
+        )
+        return f"grad={grad:.4f} (expected ~1.0)"
+
     def flip_positive_dim() -> str:
         x = torch.randn(8, 16, device=device)
         return f"sum={float(torch.flip(x, [1]).sum().cpu()):.4f}"
@@ -158,6 +187,7 @@ def run_smoke_tests(device: torch.device) -> list[SmokeResult]:
         _check("elementwise backward", elementwise_backward),
         _check("matmul backward", matmul_backward),
         _check("softplus/exp/cumsum backward", unary_ops),
+        _check("softplus backward at extreme input", softplus_extreme_input),
         _check("flip (positive dim)", flip_positive_dim),
         _check("batched matmul backward", batched_matmul),
         _check("depthwise conv backward", depthwise_conv_backward),

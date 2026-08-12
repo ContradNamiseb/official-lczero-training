@@ -258,9 +258,17 @@ class KDALogDecay(nn.Module):
         # raw_decay: (batch, tokens, heads, key_dim). a_log and dt_bias
         # broadcast over batch and tokens.
         raw_decay = raw_decay.float()
+        # Clamped before softplus, not after: DirectML's softplus backward
+        # returns 0 (not ~1) past x~88 and NaN past x~89 instead of the
+        # correct ~1 either side -- see layers.SOFTPLUS_SAFE_MAX. Both this
+        # and mish() feed it an unbounded pre-activation, and this is the
+        # KDA mixer's own copy of the same landmine.
+        softplus_arg = torch.clamp(
+            raw_decay + self.dt_bias.float(), max=layers.SOFTPLUS_SAFE_MAX
+        )
         log_decay = -torch.exp(
             self.a_log.float()
-        ) * torch.nn.functional.softplus(raw_decay + self.dt_bias.float())
+        ) * torch.nn.functional.softplus(softplus_arg)
         return torch.clamp(log_decay, min=KDA_LOG_DECAY_FLOOR)
 
 

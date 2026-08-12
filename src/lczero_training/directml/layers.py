@@ -215,10 +215,28 @@ def injective_gather(
 # Activations
 # --------------------------------------------------------------------------
 
+# DirectML's softplus backward is not the standard branch-on-sign-stable
+# sigmoid(x): verified against the CPU backend, it returns 0 (not ~1) past
+# x~88 and NaN past x~89, instead of the correct ~1 either side -- consistent
+# with a kernel that computes 1/(1+exp(x)) unconditionally, which overflows
+# exp(x) to inf right where float32 does (exp(88.7) is float32's ceiling).
+# softplus(x) and its true gradient are already indistinguishable from x and
+# 1 by x=20 (checked to 1e-7), so clamping the argument here changes nothing
+# about the answer and only keeps it out of the region where this backend's
+# kernel is wrong. This is what silently corrupted the moves-left head's
+# gradient in production: dense1's output only needs to clear 88 in one unit
+# on one batch, the rest of the network reads a perfectly normal loss, and
+# the *only* symptom is a non-finite gradient with nothing non-finite
+# anywhere describe_non_finite could see -- see training.py's
+# describe_non_finite and _clip_grad_norm_preserving_origin docstrings for
+# the rest of that story.
+SOFTPLUS_SAFE_MAX = 20.0
+
 
 def mish(x: torch.Tensor) -> torch.Tensor:
     """Mish, composed from primitives rather than calling F.mish."""
-    return x * torch.tanh(torch.nn.functional.softplus(x))
+    safe = torch.nn.functional.softplus(x.clamp(max=SOFTPLUS_SAFE_MAX))
+    return x * torch.tanh(safe)
 
 
 def swish(x: torch.Tensor) -> torch.Tensor:

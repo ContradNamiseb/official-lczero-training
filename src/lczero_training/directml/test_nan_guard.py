@@ -183,17 +183,21 @@ def _skip_mode_setup(monkeypatch, bad_steps):
         [{"params": list(model.parameters()), "weight_decay": 0.0}], lr=1e-4
     )
 
-    real_clip = torch.nn.utils.clip_grad_norm_
+    from lczero_training.directml import training as training_module
+
+    real_clip = training_module._clip_grad_norm_preserving_origin
     call = {"n": 0}
 
-    def fake_clip(params, max_norm, *args, **kwargs):
+    def fake_clip(model, max_norm, *args, **kwargs):
         call["n"] += 1
-        norm = real_clip(list(params), max_norm, *args, **kwargs)
+        norm = real_clip(model, max_norm, *args, **kwargs)
         if call["n"] in bad_steps:
             return torch.tensor(float("inf"))
         return norm
 
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", fake_clip)
+    monkeypatch.setattr(
+        training_module, "_clip_grad_norm_preserving_origin", fake_clip
+    )
 
     applied = {"n": 0}
     real_step = optimizer.step

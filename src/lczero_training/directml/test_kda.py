@@ -493,6 +493,37 @@ def test_mixer_rank_forward_only_is_the_identity_permutation():
 # --------------------------------------------------------------------------
 
 
+def test_log_decay_gradient_stays_finite_at_extreme_input_on_directml(
+    dml_device,
+):
+    """Regression guard for a real production bug, not a hypothetical one.
+
+    KDALogDecay feeds an unbounded learned projection into softplus.
+    DirectML's softplus backward returns 0 (not ~1) past x~88 and NaN past
+    x~89 instead of the correct ~1 either side -- consistent with a kernel
+    computing 1/(1+exp(x)) unconditionally, overflowing exp(x) right where
+    float32 does. forward() now clamps the softplus argument to stay out of
+    that region (see layers.SOFTPLUS_SAFE_MAX). A batch that pushes
+    raw_decay this far is exactly the kind of rare-but-real input that
+    silently corrupted a real training run's gradients with nothing else in
+    the step non-finite anywhere describe_non_finite could see.
+    """
+    heads, key_dim = 4, 8
+    decay = KDALogDecay(heads, key_dim).to(dml_device)
+    raw_decay = torch.full(
+        (1, 1, heads, key_dim), 300.0, device=dml_device, dtype=torch.float32
+    )
+    raw_decay.requires_grad_(True)
+    out = decay(raw_decay)
+    out.sum().backward()
+
+    assert bool(torch.isfinite(out.detach()).all().cpu())
+    assert raw_decay.grad is not None
+    assert bool(torch.isfinite(raw_decay.grad).all().cpu())
+    assert bool(torch.isfinite(decay.a_log.grad).all().cpu())
+    assert bool(torch.isfinite(decay.dt_bias.grad).all().cpu())
+
+
 def test_mixer_runs_on_directml(dml_device):
     in_features, heads = 16, 8
     config = _make_config()

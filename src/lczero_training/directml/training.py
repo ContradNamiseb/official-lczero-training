@@ -162,6 +162,43 @@ def training_segments(
         current_step += segment_steps
 
 
+def _clip_grad_norm_preserving_origin(
+    model: LczeroModel, max_norm: float
+) -> torch.Tensor:
+    """clip_grad_norm_, but only mutates gradients when the norm is finite.
+
+    torch.nn.utils.clip_grad_norm_ always applies its clip_coef, even when
+    total_norm came back non-finite: clip_coef = max_norm / (nan + 1e-6) is
+    itself nan, and multiplying every gradient by nan overwrites every one
+    of them -- including whichever ones were still fine. describe_non_finite
+    was called after this ran, so it only ever found nan grad_norm
+    everywhere and nothing else: the actual parameter whose backward first
+    produced a non-finite value was already gone by the time anything
+    looked. This computes the same total_norm the same way, but leaves the
+    gradients untouched when it is not finite, so the one that was actually
+    bad is still there to name.
+
+    Harmless on the step this changes anything about: a non-finite
+    total_norm already means the update gets discarded by the caller,
+    either raised on ("report"/"step") or zeroed by zero_grad()
+    ("skip") -- clipping grads that are about to be thrown away was always
+    a no-op on the training dynamics, just not on what could be read back
+    out of them afterward.
+    """
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return torch.zeros((), device=next(model.parameters()).device)
+    device = grads[0].device
+    total_norm = torch.norm(
+        torch.stack([torch.norm(g.detach(), 2).to(device) for g in grads]), 2
+    )
+    if bool(torch.isfinite(total_norm)):
+        clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+        for g in grads:
+            g.detach().mul_(clip_coef)
+    return total_norm
+
+
 def train(
     *,
     config: RootConfig,
@@ -303,9 +340,7 @@ def train(
         del predictions
 
         if max_grad_norm and max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_grad_norm
-            )
+            grad_norm = _clip_grad_norm_preserving_origin(model, max_grad_norm)
         else:
             grad_norm = torch.sqrt(
                 sum(
@@ -348,13 +383,25 @@ def train(
                 if nan_check == "skip":
                     apply_update = False
                     skipped_steps += 1
+                    # Describe *before* clearing: zero_grad(set_to_none=True)
+                    # below drops every param.grad to None, and
+                    # describe_non_finite read through those same
+                    # attributes. Called after, it could only ever report
+                    # "no non-finite gradients" -- there were no gradients
+                    # left to inspect, non-finite or otherwise. That is
+                    # exactly what every skip in production logged, and it
+                    # is why the actual gradient this was trying to name was
+                    # never once identified.
+                    detail = describe_non_finite(model)
                     optimizer.zero_grad(set_to_none=True)
                     logger.warning(
-                        "Non-finite gradient at step %d; skipping this "
-                        "update and continuing (%d skipped so far). %s",
+                        "Non-finite gradient at step %d (grad_norm=%s); "
+                        "skipping this update and continuing (%d skipped "
+                        "so far). %s",
                         step,
+                        float(grad_norm),
                         skipped_steps,
-                        describe_non_finite(model),
+                        detail,
                     )
                     if skipped_steps > max_skips > 0:
                         # A handful of skips is a bad batch; a flood is a
@@ -365,7 +412,7 @@ def train(
                             step,
                             f"{skipped_steps} skipped updates exceeds "
                             f"--max-skips={max_skips}; this is divergence, "
-                            f"not a bad batch. {describe_non_finite(model)}",
+                            f"not a bad batch. {detail}",
                         )
                 else:
                     raise NonFiniteGradientError(
@@ -540,15 +587,33 @@ def describe_non_finite(model: LczeroModel, limit: int = 6) -> str:
     with nothing in the log but `total=nan` a quarter of an hour later.
     Distinguishing bad *gradients* over good *weights* from both being bad
     says whether this step caused it or an earlier one did.
+
+    Also ranks parameters by grad L2 norm, computed in float64 on the CPU.
+    This is the check that actually explains a non-finite ``grad_norm``
+    when every per-element ``isfinite`` check below comes back clean:
+    clip_grad_norm_ reduces each parameter's norm and then combines those
+    norms in float32, and a gradient with large-but-finite elements
+    (nowhere near float32's ~3.4e38 ceiling individually) can still
+    square-and-sum past it during that reduction. float64 has ~1.8e308 of
+    headroom, so the same computation done here does not re-overflow the
+    very thing it is trying to measure, and the ranking names which
+    parameter's gradient is actually huge instead of leaving every check
+    reporting "clean". On the CPU because DirectML has no float64 kernels
+    at all -- doing this on-device raises "The GPU device does not support
+    Double (Float64) operations!" instead of returning an answer.
     """
     bad_params: list[str] = []
     bad_grads: list[str] = []
+    grad_norms: list[tuple[float, str]] = []
     with torch.no_grad():
         for name, param in model.named_parameters():
             if not torch.isfinite(param).all():
                 bad_params.append(name)
-            if param.grad is not None and not torch.isfinite(param.grad).all():
+            if param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
                 bad_grads.append(name)
+            grad_norms.append((param.grad.cpu().double().norm().item(), name))
 
     def summarise(names: list[str], what: str) -> str:
         if not names:
@@ -556,6 +621,11 @@ def describe_non_finite(model: LczeroModel, limit: int = 6) -> str:
         shown = ", ".join(names[:limit])
         more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
         return f"{len(names)} non-finite {what}: {shown}{more}"
+
+    grad_norms.sort(reverse=True)
+    largest = ", ".join(
+        f"{name}={norm:.3g}" for norm, name in grad_norms[:limit]
+    )
 
     weights_ok = not bad_params
     return (
@@ -566,6 +636,7 @@ def describe_non_finite(model: LczeroModel, limit: int = 6) -> str:
             if weights_ok
             else " The weights are already bad, so the origin is earlier."
         )
+        + f" Largest grad norms (float64): {largest}."
     )
 
 
