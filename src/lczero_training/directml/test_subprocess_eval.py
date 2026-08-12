@@ -215,21 +215,46 @@ def test_a_failing_worker_does_not_stop_training(tmp_path, monkeypatch, caplog):
     )
 
 
+class _FakeHungProcess:
+    """Stands in for a Popen handle that never returns.
+
+    Real enough for spawn_and_wait to work with: a pid, a wait() that always
+    times out, and a kill()/wait() pair for the cleanup path. Fake enough
+    that no process is actually spawned, so the test stays fast and
+    deterministic -- the same reason the old test faked subprocess.run.
+    """
+
+    def __init__(self, pid: int):
+        self.pid = pid
+
+    def wait(self, timeout=None):
+        if timeout is not None:
+            import subprocess
+
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+        return 0  # the final, post-kill wait() in the cleanup path
+
+    def kill(self):
+        pass
+
+
 def test_a_hung_worker_is_killed_and_the_eval_skipped(
     tmp_path, monkeypatch, caplog
 ):
     import logging
-    import subprocess
 
     config = make_tiny_config()
+    spawned = []
 
-    def timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd="worker", timeout=1.0)
+    def fake_popen(command, **kwargs):
+        process = _FakeHungProcess(pid=len(spawned) + 1000)
+        spawned.append(process)
+        return process
 
     monkeypatch.setattr(
         subprocess_eval, "work_directory", lambda _: tmp_path / "work"
     )
-    monkeypatch.setattr(subprocess, "run", timeout)
+    monkeypatch.setattr(subprocess_eval.subprocess, "Popen", fake_popen)
 
     hook = subprocess_eval.make_eval_hook(
         config=config,
@@ -238,19 +263,126 @@ def test_a_hung_worker_is_killed_and_the_eval_skipped(
         config_filepath=str(tmp_path / "config.textproto"),
         batch_count=1,
         timeout=1.0,
+        retries=0,
         on_scalars=lambda step, scalars: pytest.fail("should not report"),
     )
 
     with caplog.at_level(logging.ERROR):
         hook(99)
 
+    assert len(spawned) == 1, "retries=0 must mean exactly one attempt"
     assert any("timed out" in record.message for record in caplog.records)
-    # No worker ran, so there is no log to quote -- but the message must say
-    # so rather than leaving the reader wondering where to look.
+    # Its PID is known even though it never finished -- the whole point of
+    # spawning through Popen instead of subprocess.run(timeout=...).
+    assert any(
+        str(spawned[0].pid) in record.message for record in caplog.records
+    )
+    # No worker actually ran, so there is no log to quote -- but the message
+    # must say so rather than leaving the reader wondering where to look.
     assert any(
         "no log" in record.message or "empty" in record.message
         for record in caplog.records
     ), "a timeout must point at the worker's log, or say there is none"
+
+
+def test_a_hung_worker_is_retried_before_giving_up(
+    tmp_path, monkeypatch, caplog
+):
+    """The default: one retry, so two attempts before the eval is skipped."""
+    import logging
+
+    config = make_tiny_config()
+    spawned = []
+
+    def fake_popen(command, **kwargs):
+        process = _FakeHungProcess(pid=len(spawned) + 2000)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(
+        subprocess_eval, "work_directory", lambda _: tmp_path / "work"
+    )
+    monkeypatch.setattr(subprocess_eval.subprocess, "Popen", fake_popen)
+
+    hook = subprocess_eval.make_eval_hook(
+        config=config,
+        model=torch.nn.Linear(2, 2),
+        loader=_FakeLoader(batch=2),
+        config_filepath=str(tmp_path / "config.textproto"),
+        batch_count=1,
+        timeout=1.0,
+        # retries left at the default (1).
+        on_scalars=lambda step, scalars: pytest.fail("should not report"),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        hook(99)
+
+    assert len(spawned) == 2, "one retry means two spawn attempts"
+    assert any(
+        "did not succeed in 2 attempt" in record.message
+        for record in caplog.records
+    )
+
+
+def test_a_worker_that_succeeds_on_retry_still_reports(tmp_path, monkeypatch):
+    """The point of retrying: a transient failure must not cost the eval."""
+    import json
+
+    config = make_tiny_config()
+    work = tmp_path / "work"
+    work.mkdir()
+    calls = {"n": 0}
+
+    class _FlakyThenFine:
+        """Times out on the first real attempt, succeeds on the second.
+
+        ``wait()`` is also called once more per attempt with no timeout, to
+        reap the process after ``kill()`` -- that call must always return
+        promptly and must not itself count as an attempt.
+        """
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                return 0  # the post-kill reap
+            calls["n"] += 1
+            if calls["n"] == 1:
+                import subprocess
+
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+            (work / subprocess_eval.RESULT_FILE).write_text(
+                json.dumps({"total": 1.5})
+            )
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess_eval, "work_directory", lambda _: work)
+    monkeypatch.setattr(
+        subprocess_eval.subprocess,
+        "Popen",
+        lambda command, **kwargs: _FlakyThenFine(pid=42),
+    )
+
+    reported = []
+    hook = subprocess_eval.make_eval_hook(
+        config=config,
+        model=torch.nn.Linear(2, 2),
+        loader=_FakeLoader(batch=2),
+        config_filepath=str(tmp_path / "config.textproto"),
+        batch_count=1,
+        timeout=1.0,
+        on_scalars=lambda step, scalars: reported.append((step, scalars)),
+    )
+
+    hook(99)
+
+    assert calls["n"] == 2, "must have retried exactly once"
+    assert reported == [(99, {"total": 1.5})]
 
 
 def test_a_stale_result_is_never_reported_as_a_fresh_one(tmp_path, monkeypatch):

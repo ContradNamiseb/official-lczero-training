@@ -49,8 +49,10 @@ class DirectMlTrainingDaemon:
         eval_batches: int = 50,
         eval_device: Optional[str] = None,
         eval_timeout: float = 300.0,
+        eval_retries: int = 1,
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
+        data_phase_shuffle: bool = False,
         gc_every: int = 0,
         nan_check: str = "report",
         max_skips: int = 20,
@@ -68,8 +70,10 @@ class DirectMlTrainingDaemon:
         self._eval_batches = eval_batches
         self._eval_device = eval_device
         self._eval_timeout = eval_timeout
+        self._eval_retries = eval_retries
         self._data_file_count = data_file_count
         self._data_phase_step_interval = data_phase_step_interval
+        self._data_phase_shuffle = data_phase_shuffle
         self._gc_every = gc_every
         self._nan_check = nan_check
         self._max_skips = max_skips
@@ -277,6 +281,10 @@ class DirectMlTrainingDaemon:
             file_count=self._data_file_count,
             phase_step_interval=interval,
             step=step,
+            # The source directory itself, not a user-supplied value: two
+            # corpora then never accidentally share a shuffle, and there is
+            # nothing extra to remember to keep matching across restarts.
+            shuffle_seed=source_dir if self._data_phase_shuffle else None,
         )
         # A stable path, not tempfile.mkdtemp(): the farm is rebuilt from
         # scratch on every start, so a fresh directory each time would
@@ -335,6 +343,7 @@ class DirectMlTrainingDaemon:
             device_spec=self._eval_device or self._device_spec,
             kda_chunk_size=self._kda_chunk_size,
             timeout=self._eval_timeout,
+            retries=self._eval_retries,
             on_scalars=report,
         )
 

@@ -101,6 +101,151 @@ def test_empty_directory_raises(tmp_path):
         )
 
 
+# --------------------------------------------------------------------------
+# phase_window, shuffled
+# --------------------------------------------------------------------------
+
+
+def test_shuffle_is_still_deterministic_for_a_step(tmp_path):
+    """The property a checkpoint resume depends on: same step, same window.
+    Shuffling changes what the partition looks like, not whether repeating
+    the call reproduces it."""
+    _make_corpus(tmp_path, _tar_names(20))
+    first = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=4,
+        phase_step_interval=100,
+        step=250,
+        shuffle_seed="corpus-a",
+    )
+    second = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=4,
+        phase_step_interval=100,
+        step=250,
+        shuffle_seed="corpus-a",
+    )
+    assert first == second
+
+
+def test_shuffle_is_off_by_default(tmp_path):
+    """No seed must reproduce the plain sequential behaviour exactly --
+    passing shuffle_seed=None cannot be a silent behaviour change for every
+    existing caller that does not know the parameter exists."""
+    names = _tar_names(12)
+    _make_corpus(tmp_path, names)
+    window = data_phasing.phase_window(
+        directory=tmp_path, file_count=4, phase_step_interval=100, step=150
+    )
+    assert [tar.name for tar in window] == names[4:8]
+
+
+def test_shuffle_differs_from_the_sequential_grouping(tmp_path):
+    """The whole point: a real seed must not just reproduce oldest-first."""
+    names = _tar_names(30)
+    _make_corpus(tmp_path, names)
+    sequential = data_phasing.phase_window(
+        directory=tmp_path, file_count=5, phase_step_interval=100, step=0
+    )
+    shuffled = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=5,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-b",
+    )
+    assert [t.name for t in shuffled] != [t.name for t in sequential]
+
+
+def test_shuffle_covers_the_corpus_exactly_once_per_epoch(tmp_path):
+    """A shuffle must still be a partition: nothing dropped, nothing
+    duplicated within one lap through every phase."""
+    names = _tar_names(23)  # not a multiple of file_count
+    _make_corpus(tmp_path, names)
+    seen: set[str] = set()
+    num_groups = -(-23 // 4)
+    for phase in range(num_groups):
+        window = data_phasing.phase_window(
+            directory=tmp_path,
+            file_count=4,
+            phase_step_interval=100,
+            step=phase * 100,
+            shuffle_seed="corpus-c",
+        )
+        overlap = seen & {t.name for t in window}
+        assert not overlap, f"phase {phase} repeated {overlap}"
+        seen.update(t.name for t in window)
+    assert seen == set(names)
+
+
+def test_shuffle_reseeds_on_the_next_epoch(tmp_path):
+    """A run long enough to lap back to phase 0 must not see the identical
+    partition it saw last lap -- that was the actual complaint: fixed
+    windows repeating at fixed intervals forever."""
+    names = _tar_names(30)
+    _make_corpus(tmp_path, names)
+    num_groups = -(-30 // 5)
+    epoch_length = num_groups * 100
+    first_epoch = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=5,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-d",
+    )
+    second_epoch = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=5,
+        phase_step_interval=100,
+        step=epoch_length,
+        shuffle_seed="corpus-d",
+    )
+    assert [t.name for t in first_epoch] != [t.name for t in second_epoch]
+
+
+def test_shuffle_stays_within_one_epoch_for_the_whole_lap(tmp_path):
+    """Two steps in the same lap must draw from the same shuffled partition,
+    the same way two steps in the same sequential group always have."""
+    names = _tar_names(20)
+    _make_corpus(tmp_path, names)
+    early = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=4,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-e",
+    )
+    late = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=4,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-e",
+    )
+    assert early == late
+
+
+def test_different_seeds_shuffle_differently(tmp_path):
+    """Confirms the seed is load-bearing, not decorative."""
+    names = _tar_names(30)
+    _make_corpus(tmp_path, names)
+    a = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=5,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-f",
+    )
+    b = data_phasing.phase_window(
+        directory=tmp_path,
+        file_count=5,
+        phase_step_interval=100,
+        step=0,
+        shuffle_seed="corpus-g",
+    )
+    assert [t.name for t in a] != [t.name for t in b]
+
+
 def test_invalid_arguments_raise(tmp_path):
     _make_corpus(tmp_path, _tar_names(4))
     with pytest.raises(DataPhasingError):

@@ -20,14 +20,30 @@ of ``file_count``, and the phase index is
 ``(step // phase_step_interval) % num_groups``. Resuming from a checkpoint
 at step N automatically lands on the same window that step would have used,
 so the feature survives restarts and checkpoint resume.
+
+``shuffle_seed`` trades the chronological curriculum for variety. Passing it
+does not make phase selection non-reproducible -- the same (seed, step)
+still yields the same window, which is what a checkpoint resume depends on
+-- it changes what "the same" means. Sequential grouping means phase 0 is
+always the oldest tars and phase 1 is always the next-oldest, forever;
+across a run with many restarts against a small ``file_count``, that is a
+handful of fixed neighbor groups repeating on a fixed schedule. Shuffling
+partitions the corpus into ``file_count``-sized groups after randomizing the
+order, so a run instead see a fresh combination of tars, and a run long
+enough to lap back to phase 0 (every ``num_groups * phase_step_interval``
+steps) gets a freshly reshuffled partition rather than the exact one it saw
+last time -- still a full, non-overlapping partition of the corpus within
+any one lap, just not the same one twice.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import os
 import pathlib
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +98,22 @@ def phase_window(
     file_count: int,
     phase_step_interval: int,
     step: int,
+    shuffle_seed: str | None = None,
 ) -> list[pathlib.Path]:
     """The tar files for the phase that owns ``step``.
 
     Raises DataPhasingError if the window cannot be built. Returns a list of
-    ``file_count`` paths, oldest first, chosen deterministically from the
-    step so a resumed run reproduces the same window.
+    ``file_count`` paths, chosen deterministically from ``step`` (and
+    ``shuffle_seed``, if given) so a resumed run reproduces the same window.
+
+    Oldest-first when ``shuffle_seed`` is None (the default): phase 0 is
+    always the oldest tars, phase 1 the next-oldest, and so on -- a fixed
+    chronological curriculum. With a seed, the corpus is instead partitioned
+    after a pseudo-random shuffle, reseeded once per "epoch" (one full lap
+    through every phase, ``num_groups * phase_step_interval`` steps) so a
+    run that laps more than once does not see the exact same partition
+    twice. Still fully deterministic: the same directory contents, seed and
+    step always produce the same window.
     """
     if file_count < 1:
         raise DataPhasingError(f"file_count must be >= 1, got {file_count}")
@@ -96,21 +122,52 @@ def phase_window(
             f"phase_step_interval must be >= 1, got {phase_step_interval}"
         )
     tars = _list_tars(directory)
+    ordered = list(tars)
+    epoch = None
+    if shuffle_seed:
+        num_groups = -(-len(tars) // file_count)  # ceil division
+        epoch = step // (phase_step_interval * num_groups)
+        # sha256 rather than Python's hash(): that one is salted per
+        # process (PYTHONHASHSEED), so two runs -- or a run and the daemon
+        # that resumed it -- would shuffle differently for what is meant to
+        # be the identical window.
+        digest = hashlib.sha256(
+            f"{shuffle_seed}:{epoch}".encode("utf-8")
+        ).hexdigest()
+        random.Random(digest).shuffle(ordered)
     groups = [
-        tars[index : index + file_count]
-        for index in range(0, len(tars), file_count)
+        ordered[index : index + file_count]
+        for index in range(0, len(ordered), file_count)
     ]
     phase = (step // phase_step_interval) % len(groups)
     window = groups[phase]
-    logger.info(
-        "Data phase %d/%d for step %d: %d tar(s), %s .. %s",
-        phase + 1,
-        len(groups),
-        step,
-        len(window),
-        window[0].name,
-        window[-1].name,
-    )
+    if shuffle_seed:
+        # Not a ".. " range: a shuffled window's first and last entries are
+        # not its oldest and newest, so presenting them as a span would be
+        # actively misleading. List a few instead.
+        sample = ", ".join(tar.name for tar in window[:3])
+        more = f" (+{len(window) - 3} more)" if len(window) > 3 else ""
+        logger.info(
+            "Data phase %d/%d for step %d (shuffled, epoch %d): "
+            "%d tar(s): %s%s",
+            phase + 1,
+            len(groups),
+            step,
+            epoch,
+            len(window),
+            sample,
+            more,
+        )
+    else:
+        logger.info(
+            "Data phase %d/%d for step %d: %d tar(s), %s .. %s",
+            phase + 1,
+            len(groups),
+            step,
+            len(window),
+            window[0].name,
+            window[-1].name,
+        )
     return window
 
 

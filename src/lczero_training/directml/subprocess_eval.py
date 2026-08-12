@@ -35,6 +35,25 @@ means contending for the exact resource the run is short of.
 
 A failed or hung worker is logged and skipped. Evaluation is observational,
 and no measurement is worth ending a training run over.
+
+The timeout has genuinely fired in production -- 16 for 16 automatic evals
+in one real run, always at exactly ``timeout`` seconds, the worker's own log
+never touched. What did NOT reproduce it, each tried as a controlled,
+faithful concurrent-with-live-training test: --device cpu with the real
+work-dir files (standalone); the same, spawned while the real trainer was
+actively stepping; spawned through the actual supervisor -> daemon process
+chain (matching production's exact subprocess.Popen pattern, not a bare
+console); and spawned with --gc-every and --eval-every forced to the same
+step so a full gc.collect() lands immediately before the spawn, since
+production's defaults (500 and any multiple of it, e.g. 5000) make that
+coincidence happen on literally every automatic eval. All four succeeded in
+10-15 seconds. So this is real, but its trigger needs something none of
+those four hours of testing reproduced -- plausibly many hours of live
+uptime, which a short test cannot compress. Rather than ship an unproven
+theory, this module now does two honest things: makes the next real
+occurrence diagnosable (the worker's PID and a live forensic snapshot are
+logged before anything is killed), and adds one bounded retry, cheap
+insurance against whatever fraction of the cause turns out to be transient.
 """
 
 from __future__ import annotations
@@ -66,6 +85,16 @@ WORKER_LOG_FILE = "worker.log"
 # damage one stuck eval can do rather than a generous allowance. Measured: 50
 # batches on the CPU take 15 s end to end, imports included.
 DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# One retry beyond the first attempt. Cheap insurance, not a fix: if the real
+# trigger is a transient condition (a momentary I/O or driver stall), this
+# rides through it for the cost of one more `timeout` on the rare step where
+# it happens; if the trigger is a persistent per-process condition, this
+# retry fails the same way and costs one extra `timeout` for nothing. Either
+# way the trainer is never blocked longer than (1 + DEFAULT_RETRIES) *
+# timeout on any one eval, and it was never blocking training itself either
+# way -- a skipped eval just means one fewer point on the chart.
+DEFAULT_RETRIES = 1
 
 
 def work_directory(config_filepath: str) -> pathlib.Path:
@@ -125,6 +154,40 @@ def read_batches(path: pathlib.Path) -> tuple[Iterator[tuple], int]:
     return batches(), count
 
 
+def _diagnose_hang(process: subprocess.Popen) -> str:
+    """A live forensic snapshot of a worker that has not finished in time.
+
+    Called before the process is killed, so this is the only chance to see
+    what it was actually doing. ``cpu_times()`` near zero is the most
+    useful bit: a worker parked waiting on something (a lock, a driver
+    call, a handle) burns no CPU while it waits, where one that is merely
+    slow keeps accumulating it. Best-effort: psutil may be unavailable, and
+    the process may finish or vanish between the timeout firing and this
+    running.
+    """
+    try:
+        import psutil
+
+        info = psutil.Process(process.pid)
+        cpu = info.cpu_times()
+        busy = cpu.user + cpu.system
+        return (
+            f"PID {process.pid}: status={info.status()} "
+            f"threads={info.num_threads()} cpu={busy:.2f}s -- "
+            + (
+                "parked (no CPU consumed; waiting on a lock, a handle, or "
+                "the OS, not merely slow)"
+                if busy < 0.05
+                else "was consuming CPU, not stuck idle"
+            )
+        )
+    except Exception:  # noqa: BLE001 - forensics must not raise
+        return (
+            f"PID {process.pid}: could not inspect (psutil unavailable, or "
+            "the process has already exited)"
+        )
+
+
 def make_eval_hook(
     *,
     config,
@@ -135,13 +198,16 @@ def make_eval_hook(
     device_spec: str | None = None,
     kda_chunk_size: int | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRIES,
     on_scalars: Callable[[int, dict[str, float]], None] | None = None,
 ) -> Callable[[int], None]:
     """An eval callback that runs the measurement in a child process.
 
     ``on_scalars`` receives the results for logging or the TUI; the
     TensorBoard ``-test`` run is written by the worker, not from here, so no
-    writer for it stays open in the training process.
+    writer for it stays open in the training process. ``retries`` is extra
+    attempts after the first failure -- see ``DEFAULT_RETRIES`` for why one
+    is worth the cost and why it is not a fix.
     """
     from google.protobuf import text_format
 
@@ -172,7 +238,53 @@ def make_eval_hook(
     if kda_chunk_size:
         command += [f"--kda-chunk-size={kda_chunk_size}"]
 
-    def run(step: int) -> dict[str, float]:
+    def spawn_and_wait(step: int) -> dict[str, float]:
+        """One attempt: spawn, wait up to ``timeout``, return the scalars.
+
+        Popen rather than ``subprocess.run(timeout=...)``: run() gives no
+        access to the child until it is already finished or being killed,
+        so a hung worker left no PID, no status, nothing to inspect --
+        which is exactly the gap that made the earlier stalls unexplainable.
+        Logging the PID the moment it exists is cheap and was missing.
+        """
+        process = subprocess.Popen(
+            command + [f"--step={step}"],
+            # The daemon's stdout carries the TUI protocol and this process
+            # inherits it. The worker logs to stderr; anything it writes to
+            # stdout would corrupt that stream, so stdout goes nowhere.
+            stdout=subprocess.DEVNULL,
+        )
+        logger.info(
+            "Eval worker for step %d spawned as PID %d", step, process.pid
+        )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Before killing it: this is the only moment its state can still
+            # be read. Once terminated there is nothing left to inspect.
+            logger.error(
+                "Eval worker PID %d (step %d) exceeded %.0fs: %s",
+                process.pid,
+                step,
+                timeout,
+                _diagnose_hang(process),
+            )
+            process.kill()
+            process.wait()
+            raise
+        if returncode != 0:
+            raise RuntimeError(
+                f"the eval worker (PID {process.pid}) exited with code "
+                f"{returncode}"
+            )
+        return json.loads(result_path.read_text())
+
+    def prepare(step: int) -> None:
+        """Write the weights and batches for ``step``. Run once per hook
+        call, not once per attempt: a retry reuses this request rather than
+        re-paying the weight copy and the batch pull for what is, if a
+        retry helps at all, presumably unrelated to the data.
+        """
         import torch
 
         # Never let a failed worker hand back the previous eval's numbers.
@@ -192,21 +304,6 @@ def make_eval_hook(
         logger.info(
             "Evaluating step %d in a subprocess on %d batch(es)", step, stored
         )
-
-        completed = subprocess.run(
-            command + [f"--step={step}"],
-            # The daemon's stdout carries the TUI protocol and this process
-            # inherits it. The worker logs to stderr; anything it writes to
-            # stdout would corrupt that stream, so stdout goes nowhere.
-            stdout=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"the eval worker exited with code {completed.returncode}"
-            )
-        return json.loads(result_path.read_text())
 
     def worker_tail(lines: int = 8) -> str:
         """The last of the worker's own log, for a failure message.
@@ -229,23 +326,50 @@ def make_eval_hook(
 
     def hook(step: int) -> None:
         try:
-            scalars = run(step)
-        except subprocess.TimeoutExpired:
-            logger.error(
-                "Evaluation at step %d timed out after %.0fs and was killed; "
-                "training continues. The worker got this far:\n%s",
-                step,
-                timeout,
-                worker_tail(),
-            )
-            return
+            prepare(step)
         except Exception:  # noqa: BLE001 - a measurement cannot end a run
             logger.exception(
-                "Evaluation at step %d failed; training continues. The worker "
-                "got this far:\n%s",
+                "Could not prepare the eval request at step %d; training "
+                "continues",
                 step,
-                worker_tail(),
             )
+            return
+
+        attempts = 1 + max(retries, 0)
+        scalars: dict[str, float] | None = None
+        for attempt in range(1, attempts + 1):
+            label = (
+                f"attempt {attempt}/{attempts}" if attempts > 1 else "attempt"
+            )
+            try:
+                scalars = spawn_and_wait(step)
+                break
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "Evaluation at step %d timed out after %.0fs (%s). The "
+                    "worker got this far:\n%s",
+                    step,
+                    timeout,
+                    label,
+                    worker_tail(),
+                )
+            except Exception:  # noqa: BLE001 - a measurement cannot end a run
+                logger.exception(
+                    "Evaluation at step %d failed (%s). The worker got this "
+                    "far:\n%s",
+                    step,
+                    label,
+                    worker_tail(),
+                )
+
+        if scalars is None:
+            if attempts > 1:
+                logger.error(
+                    "Evaluation at step %d did not succeed in %d attempt(s); "
+                    "training continues",
+                    step,
+                    attempts,
+                )
             return
         if scalars and on_scalars is not None:
             on_scalars(step, scalars)

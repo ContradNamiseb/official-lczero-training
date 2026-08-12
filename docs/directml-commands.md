@@ -308,8 +308,14 @@ proactive restart. It refuses to start rather than let that happen.
 | `--eval-batches N` | batches per evaluation (default 50) |
 | `--eval-device D` | `cpu` by default, and deliberately |
 | `--eval-timeout S` | kill a stuck evaluation after S seconds and skip it (default 300) |
+| `--eval-retries N` | extra attempts after a failed eval before giving up on that step (default 1). Cheap insurance, not a fix — see §9 |
 | `--gc-every N` | force a Python collection every N steps (default 500) |
 | `--report-every N` | metrics cadence to TensorBoard and the dashboard |
+| `--nan-check M` | `report` (default) checks on the reporting cadence and stops on a bad gradient; `step` checks every step (+7%) and stops on the exact one; `skip` rides through bad gradients instead of stopping, up to `--max-skips`; `off` disables it |
+| `--max-skips N` | with `--nan-check skip`, give up after this many skipped updates (default 20) |
+| `--data-file-count N` | limit the visible corpus to this many tars per phase, to keep the loader's resident metadata small on a long run |
+| `--data-phase-step-interval N` | steps per data phase (default 25000) |
+| `--data-phase-shuffle` | randomize which tars each phase gets, instead of a fixed oldest-to-newest sequence. Still reproducible on resume — same step, same window — but a run that laps back to phase 0 gets a fresh shuffle rather than the exact partition it used last lap |
 
 ---
 
@@ -345,8 +351,24 @@ step rather than the reporting window. It costs ~7% throughput (measured:
 +37 ms on a 518 ms step), which is why `report` is the default.
 
 **A run stopped and the last line mentions an evaluation** — it is not stuck.
-The trainer waits up to `--eval-timeout`, skips the evaluation, and carries on.
-No steps are lost.
+The trainer waits up to `--eval-timeout` (times `1 + --eval-retries`), skips
+the evaluation, and carries on. No steps are lost — the log will say
+`did not succeed in N attempt(s); training continues` and keep going.
+
+**Every automatic eval times out, always at exactly `--eval-timeout`, worker's
+log never touched** — this happened for real (16 for 16 in one run) and the
+cause is still open. Four faithful reproductions were tried — CPU device with
+the real request files, concurrent with genuinely live training, through the
+actual supervisor→daemon process chain, and with `--gc-every`/`--eval-every`
+forced to the same step (production's defaults make that coincide on every
+automatic eval by construction) — and all four succeeded in 10-15 s. So it is
+real, but needs something a short test cannot compress, plausibly many hours
+of live uptime. Two things now help without requiring the cause to be known:
+the log names the worker's **PID** and a live CPU/thread snapshot the moment
+the timeout fires, so a future occurrence — watched live — can be inspected
+with `tasklist` / a debugger while it is still hung; and `--eval-retries`
+(default 1) rides through it if the true cause turns out to be transient.
+If it recurs, the PID and snapshot in the log are the next real lead.
 
 **Checkpoint digest mismatch after editing the config** — the digest covers the
 `model` and `training.optimizer` sections; changing either invalidates existing

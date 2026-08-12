@@ -68,7 +68,19 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help=(
             "Steps per data phase; the tar window advances every this many "
-            "steps. Defaults to 250000 when --data-file-count is set."
+            "steps. Defaults to 25000 when --data-file-count is set."
+        ),
+    )
+    parser.add_argument(
+        "--data-phase-shuffle",
+        action="store_true",
+        help=(
+            "Randomize which tars each data phase gets, instead of the "
+            "default fixed oldest-to-newest sequence. Still fully "
+            "reproducible on resume -- the same step always gets the same "
+            "window -- but a run that laps back to phase 0 gets a freshly "
+            "reshuffled partition of the corpus rather than the exact one "
+            "it used last lap. Only meaningful with --data-file-count."
         ),
     )
     parser.add_argument(
@@ -142,6 +154,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "measured 15 s, which leaves room for a contended machine."
         ),
     )
+    parser.add_argument(
+        "--eval-retries",
+        type=int,
+        default=1,
+        help=(
+            "Extra attempts after a failed eval, before giving up on that "
+            "step. Cheap insurance against a transient stall, not a fix for "
+            "a persistent one -- each retry costs up to --eval-timeout "
+            "again. 0 disables retrying."
+        ),
+    )
     return parser
 
 
@@ -175,8 +198,10 @@ def main(argv: list[str] | None = None) -> int:
         eval_batches=args.eval_batches,
         eval_device=args.eval_device,
         eval_timeout=args.eval_timeout,
+        eval_retries=args.eval_retries,
         data_file_count=args.data_file_count,
         data_phase_step_interval=args.data_phase_step_interval,
+        data_phase_shuffle=args.data_phase_shuffle,
         gc_every=args.gc_every,
         nan_check=args.nan_check,
         max_skips=args.max_skips,
