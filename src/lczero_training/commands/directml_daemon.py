@@ -129,7 +129,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "costs the trainer no device memory. 0 disables."
         ),
     )
-    parser.add_argument("--eval-batches", type=int, default=50)
+    parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument(
         "--eval-device",
         default="cpu",
@@ -146,12 +146,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-timeout",
         type=float,
-        default=300.0,
+        default=600.0,
         help=(
             "Seconds before a stuck eval worker is killed and the eval "
             "skipped. Every second of it is a second training is paused, so "
-            "this is a ceiling on the damage one bad eval can do -- 20x the "
-            "measured 15 s, which leaves room for a contended machine."
+            "this is a ceiling on the damage one bad eval can do -- ~40x the "
+            "measured 15 s of CPU work at 20 batches, which leaves room for a "
+            "contended machine and the occasional import-phase stall that "
+            "parked every 5k-step eval here for a full week."
         ),
     )
     parser.add_argument(
@@ -163,6 +165,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "step. Cheap insurance against a transient stall, not a fix for "
             "a persistent one -- each retry costs up to --eval-timeout "
             "again. 0 disables retrying."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-config-mismatch",
+        action="store_true",
+        help=(
+            "Resume from a checkpoint whose model/optimizer config digest "
+            "differs from this run's. Needed exactly once when the config "
+            "changes in a structurally-safe way (e.g. a policy_head removed "
+            "from the model block): the next checkpoint is written with the "
+            "new digest, so the flag can be dropped afterwards."
         ),
     )
     return parser
@@ -205,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
         gc_every=args.gc_every,
         nan_check=args.nan_check,
         max_skips=args.max_skips,
+        ignore_config_mismatch=args.ignore_config_mismatch,
     )
     return daemon.run()
 

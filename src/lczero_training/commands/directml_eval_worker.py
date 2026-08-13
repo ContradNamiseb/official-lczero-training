@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     from google.protobuf import text_format
 
     logger.info("Importing the DirectML backend")
+    from lczero_training.directml import checkpoint as checkpoint_io
     from lczero_training.directml import device as dml_device
     from lczero_training.directml import derived_metrics
     from lczero_training.directml import metrics as metrics_sinks
@@ -136,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
         map_location="cpu",
         weights_only=False,
     )
-    model.load_state_dict(payload["model_state"])
+    # tolerate extra tensors in the saved state dict if a policy_head was
+    # dropped from the config mid-run; refuse a missing tensor.
+    checkpoint_io.load_state_dict_into(model, payload["model_state"])
     model.to(device)
     # The test run carries the KDA gate diagnostics, and the mixers only
     # capture them when asked. In-process eval used to get this by accident,
@@ -185,8 +188,29 @@ def main(argv: list[str] | None = None) -> int:
             writer.close()
 
     (work_dir / subprocess_eval.RESULT_FILE).write_text(json.dumps(scalars))
+    # Total alone is not enough to diagnose a stalled head: the per-step
+    # training log is too noisy to read at effective batch 64, so the held-out
+    # eval line is the place a flat policy head will show up. The headline
+    # per-loss scalars follow total on the same line so a plain
+    # `grep "Evaluated step"` covers it without opening TensorBoard.
+    headline = (
+        "policy/main_ce=%(policy/main_ce).4f"
+        "  value/winner=%(value/winner).4f"
+        "  movesleft/main=%(movesleft/main).4f"
+    )
+    # Missing heads (e.g. an omitted moves-left config) should not raise here:
+    # use the sentinel and let the formatted value print nan.
+    fmt = {
+        key: scalars.get(key, float("nan"))
+        for key in (
+            "policy/main_ce",
+            "value/winner",
+            "movesleft/main",
+        )
+    }
     logger.info(
-        "Evaluated step %d over %d batch(es) on %s: total=%.4f",
+        "Evaluated step %d over %d batch(es) on %s: total=%.4f  "
+        + headline % fmt,
         args.step,
         count,
         device,

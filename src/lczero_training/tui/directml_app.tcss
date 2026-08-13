@@ -28,6 +28,18 @@ Screen {
 #row-top > Static,
 #row-mid > Static {
     width: 1fr;
+    /* Static defaults to height: auto, sized off whatever render_panel()
+       returns at the moment of first layout -- almost always the
+       one-line "no data yet" placeholder, since the daemon hasn't sent a
+       single step yet when compose() runs. Widget.refresh() (used on
+       every metrics update, see directml_app.py's _ingest_metrics) does
+       NOT re-layout by default, only repaints, so an auto-sized panel
+       never grows past that first frame: real, multi-row tables get
+       clipped down to their header. 1fr fills the row's fixed height
+       (see #row-top/#row-mid above) up front, independent of content, so
+       there is nothing left to freeze.
+    */
+    height: 1fr;
     border: round $panel-lighten-2;
     border-title-color: $text-muted;
     padding: 0 1;

@@ -221,22 +221,61 @@ def injective_gather(
 # with a kernel that computes 1/(1+exp(x)) unconditionally, which overflows
 # exp(x) to inf right where float32 does (exp(88.7) is float32's ceiling).
 # softplus(x) and its true gradient are already indistinguishable from x and
-# 1 by x=20 (checked to 1e-7), so clamping the argument here changes nothing
-# about the answer and only keeps it out of the region where this backend's
-# kernel is wrong. This is what silently corrupted the moves-left head's
-# gradient in production: dense1's output only needs to clear 88 in one unit
-# on one batch, the rest of the network reads a perfectly normal loss, and
-# the *only* symptom is a non-finite gradient with nothing non-finite
-# anywhere describe_non_finite could see -- see training.py's
+# 1 by x=20 (checked to 1e-7), so linearizing past that threshold changes
+# nothing about the answer and only keeps it out of the region where this
+# backend's kernel is wrong. This is what silently corrupted the moves-left
+# head's gradient in production: dense1's output only needs to clear 88 in
+# one unit on one batch, the rest of the network reads a perfectly normal
+# loss, and the *only* symptom is a non-finite gradient with nothing
+# non-finite anywhere describe_non_finite could see -- see training.py's
 # describe_non_finite and _clip_grad_norm_preserving_origin docstrings for
 # the rest of that story.
+#
+# Rather than clamp at every call site, ``torch.nn.functional.softplus`` is
+# monkey-patched globally below to a threshold-linearized implementation,
+# so every caller (mish, KDA log-decay, the device smoke tests) is protected
+# without per-call clamping.
 SOFTPLUS_SAFE_MAX = 20.0
+
+
+def safe_directml_softplus(
+    input: torch.Tensor, beta: float = 1, threshold: float = SOFTPLUS_SAFE_MAX
+) -> torch.Tensor:
+    """Stable softplus for Intel DirectML.
+
+    Mirrors the threshold-linearized form of ``torch.nn.functional.softplus``
+    that DirectML's translation omits: for ``input * beta`` above
+    ``threshold`` it returns ``input`` exactly, and below it the usual
+    ``log1p(exp(...)) / beta``. The argument fed to ``exp`` is clamped to
+    ``threshold`` first, so the non-selected branch never produces an
+    overflowing local gradient in backward -- a bare ``torch.where`` would
+    still compute ``exp`` of the large values and yield ``0 * inf = NaN``
+    gradients on this backend.
+    """
+    scaled = input * beta
+    return torch.where(
+        scaled > threshold,
+        input,
+        torch.log1p(torch.exp(scaled.clamp(max=threshold))) / beta,
+    )
+
+
+# Install the override globally for the DirectML backend. ``setattr`` is used
+# so static type checkers do not flag the signature mismatch with PyTorch's
+# overloaded ``softplus``.
+setattr(torch.nn.functional, "softplus", safe_directml_softplus)
+setattr(
+    torch.nn.Softplus,
+    "forward",
+    lambda self, input: safe_directml_softplus(
+        input, self.beta, self.threshold
+    ),
+)
 
 
 def mish(x: torch.Tensor) -> torch.Tensor:
     """Mish, composed from primitives rather than calling F.mish."""
-    safe = torch.nn.functional.softplus(x.clamp(max=SOFTPLUS_SAFE_MAX))
-    return x * torch.tanh(safe)
+    return x * torch.tanh(torch.nn.functional.softplus(x))
 
 
 def swish(x: torch.Tensor) -> torch.Tensor:

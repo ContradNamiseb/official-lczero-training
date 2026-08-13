@@ -139,11 +139,24 @@ def run_smoke_tests(device: torch.device) -> list[SmokeResult]:
         # kernel that computes 1/(1+exp(x)) unconditionally, overflowing
         # exp(x) right where float32 does. This silently corrupted a real
         # training run's moves-left head gradient with nothing else in the
-        # step non-finite anywhere describe_non_finite could see -- see
-        # layers.SOFTPLUS_SAFE_MAX and layers.mish, which now clamp their
-        # way around it. If this check ever starts failing, that means
-        # torch_directml changed and the clamp workaround needs revisiting,
-        # not that it needs to exist in the first place.
+        # step non-finite anywhere describe_non_finite could see. The
+        # workaround that fixed it is the global
+        # layers.safe_directml_softplus monkey-patch, which linearizes
+        # softplus past layers.SOFTPLUS_SAFE_MAX and is installed at import
+        # time of layers (which device.py pulls in), so this feed of x=200
+        # now flows through the override rather than DirectML's kernel.
+        #
+        # Two failure modes collapse here. If torch_directml's kernel ever
+        # gets fixed upstream, this check still passes (the patch dominates
+        # the kernel), so it no longer detects that regression -- it only
+        # guards the override staying installed and intact. If the
+        # monkey-patch is accidentally removed or the chosen linearization
+        # stops being finite, this check's gradient will flip to 0/NaN and
+        # the assertion fires both here (as a string) and in the dedicated
+        # pytest tripwire (test_layers.py
+        # test_mish_gradient_stays_finite_at_extreme_input_on_directml, and
+        # test_kda.py test_log_decay_gradient_stays_finite_at_extreme_input
+        # _on_directml) that do hard isfinite assertions.
         x = torch.tensor([200.0], device=device, requires_grad=True)
         torch.nn.functional.softplus(x).backward()
         assert x.grad is not None
@@ -154,8 +167,9 @@ def run_smoke_tests(device: torch.device) -> list[SmokeResult]:
         # tripwire rather than a string someone has to read.
         assert abs(grad - 1.0) < 1e-3, (
             f"softplus backward at x=200 gave grad={grad}, expected ~1.0 -- "
-            "either DirectML's kernel changed or layers.SOFTPLUS_SAFE_MAX "
-            "needs revisiting"
+            "either the layers.safe_directml_softplus override is no "
+            "longer installed, or DirectML's kernel changed and "
+            "layers.SOFTPLUS_SAFE_MAX needs revisiting"
         )
         return f"grad={grad:.4f} (expected ~1.0)"
 

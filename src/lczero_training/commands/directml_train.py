@@ -96,7 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-batches",
         type=int,
-        default=50,
+        default=20,
         help="Batches per evaluation pass.",
     )
     parser.add_argument(
@@ -250,10 +250,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     model, optimizer = build_model_and_optimizer(config, device)
-    model.load_state_dict(restored.model_state)
+    checkpoint_io.load_state_dict_into(model, restored.model_state)
     model.to(device)
     if restored.optimizer_state is not None:
-        optimizer.load_state_dict(restored.optimizer_state)
+        checkpoint_io.load_optimizer_state_dict_into(
+            optimizer,
+            restored.optimizer_state,
+            model,
+            restored.model_state,
+            config.training.optimizer.nadamw.decay_selector,
+        )
     logging.info("Resumed from step %d", restored.step)
 
     checkpoint_interval = (

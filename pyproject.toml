@@ -149,6 +149,14 @@ testpaths = ["src"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["src"]
 addopts = "-v"
+markers = [
+  # Opt-in: subprocess_eval's environmental low-memory skip lives behind
+  # this marker. The default autouse fixture in test_subprocess_eval bypasses
+  # the guard; only tests that want to exercise it mark themselves with
+  # ``@pytest.mark.enable_memory_guard`` so a CI box with low free memory
+  # does not silently skip every real-spawn test for unrelated reasons.
+  "enable_memory_guard: bypass the autouse bypass of subprocess_eval's memory guard",
+]
 
 [tool.ruff]
 exclude = ["*_pb2.py*"]

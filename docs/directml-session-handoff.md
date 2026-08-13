@@ -26,7 +26,8 @@ Run to restart with:
 .\.venv-directml\Scripts\python.exe -m lczero_training.commands.directml_tui `
   --config docs/kda_split.textproto --supervise --logfile train.log -- `
   --kda-chunk-size=8 --report-every=10 --target-step=1000000 --gc-every=500 `
-  --eval-every=5000 --eval-batches=50 `
+  --eval-every=5000 --eval-batches=20 --eval-timeout=600 `
+  --ignore-config-mismatch `
   "--output=C:/Users/Contrad/Documents/lc0-directml-networks/kda-native-{step}.pb.gz"
 ```
 

@@ -375,19 +375,20 @@ def test_mish_gradient_stays_finite_at_extreme_input_on_directml(dml_device):
     they cannot exercise this: DirectML's softplus backward returns 0 (not
     ~1) past x~88 and NaN past x~89 -- consistent with a kernel computing
     1/(1+exp(x)) unconditionally, overflowing exp(x) right where float32
-    does. mish() clamps its softplus argument (layers.SOFTPLUS_SAFE_MAX)
-    specifically to stay out of that region. This silently corrupted a real
-    training run's moves-left head gradient with nothing else in the step
-    non-finite anywhere describe_non_finite could see.
+    does. mish() is protected by the global
+    layers.safe_directml_softplus monkey-patch, which linearizes softplus
+    past layers.SOFTPLUS_SAFE_MAX to stay out of that region. This silently
+    corrupted a real training run's moves-left head gradient with nothing
+    else in the step non-finite anywhere describe_non_finite could see.
     """
     x = torch.tensor([200.0, -5.0, 0.0], device=dml_device, requires_grad=True)
     out = layers.mish(x)
     out.sum().backward()
     assert _finite(out.detach())
     assert x.grad is not None and _finite(x.grad)
-    # The clamp must not change the answer for the large positive case:
-    # mish(200) is indistinguishable from 200 itself, and its gradient from
-    # 1.0, well before the clamp point.
+    # The linearization must not change the answer for the large positive
+    # case: mish(200) is indistinguishable from 200 itself, and its gradient
+    # from 1.0, well before the threshold point.
     assert abs(float(x.grad[0].cpu()) - 1.0) < 1e-3
 
 

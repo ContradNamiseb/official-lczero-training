@@ -713,6 +713,45 @@ def release_to_host(model: LczeroModel, optimizer: NAdamW | None = None) -> int:
     return moved
 
 
+def _state_dict_to_host(model: LczeroModel) -> dict[str, torch.Tensor]:
+    """``.cpu()`` every tensor once, preserving shared storage across keys.
+
+    Shared parameters -- the policy_embedding_shared Linear every policy
+    head's ``tokens`` aliases, and the smolgen shared gen-dense weight --
+    are the same storage under two different state_dict keys. Copying each
+    key independently with ``tensor.detach().cpu()`` triggers a separate
+    device-to-host transfer per key, landing in two distinct
+    freshly-allocated CPU buffers with equal values but different
+    ``data_ptr()``: checkpoint.load_optimizer_state_dict_into pairs the
+    saved optimizer state back to names by rediscovering that sharing via
+    ``data_ptr()``, so a checkpoint saved this way looks, after reload,
+    like it has 3 more independent parameters than the optimizer's state
+    does -- "the saved model has 172 float parameter(s), but the saved
+    optimizer state lists 169" -- and refuses to resume.
+
+    ``model.state_dict()`` (the default, ``keep_vars=False``) calls
+    ``.detach()`` on every entry, including the two paths to one shared
+    tensor -- and ``.detach()`` returns a fresh wrapper each time, so even
+    ``id()`` no longer agrees between them, only ``data_ptr()`` does. That
+    would be enough to dedupe by, except DirectML tensors do not support
+    ``data_ptr()`` at all before the transfer to host ("Cannot access data
+    pointer of Tensor that doesn't have storage") -- so this uses
+    ``state_dict(keep_vars=True)`` instead, which returns the live
+    parameter object itself under every key that aliases it, and dedupes
+    by ``id()`` on those -- safe here specifically because keep_vars skips
+    the per-key ``.detach()`` that would otherwise break it.
+    """
+    host_by_id: dict[int, torch.Tensor] = {}
+    result: dict[str, torch.Tensor] = {}
+    for name, tensor in model.state_dict(keep_vars=True).items():
+        host_tensor = host_by_id.get(id(tensor))
+        if host_tensor is None:
+            host_tensor = tensor.detach().cpu()
+            host_by_id[id(tensor)] = host_tensor
+        result[name] = host_tensor
+    return result
+
+
 def make_checkpoint(
     config: RootConfig,
     model: LczeroModel,
@@ -723,10 +762,7 @@ def make_checkpoint(
         step=step,
         # Always store on the host: a checkpoint written from DirectML
         # tensors would not reload on a machine without that adapter.
-        model_state={
-            name: tensor.detach().cpu()
-            for name, tensor in model.state_dict().items()
-        },
+        model_state=_state_dict_to_host(model),
         optimizer_state=optimizer.state_dict() if optimizer else None,
         config_digest=checkpoint_io.config_digest(config),
         rng_state=torch.get_rng_state(),

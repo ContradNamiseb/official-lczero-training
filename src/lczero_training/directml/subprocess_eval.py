@@ -96,6 +96,21 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 # way -- a skipped eval just means one fewer point on the chart.
 DEFAULT_RETRIES = 1
 
+# Below this much free physical memory the subprocess can no longer start its
+# python interpreter next to a live trainer. Every hung eval in the 225k-300k
+# step window of one real run was logged against ``available 2.11 GB of
+# 11.65``, while the subprocess never reached its first log line -- the
+# interpreter was parked at startup (cpu ~0), not slowly working. A second
+# ``import torch`` of its own needs commit headroom that is simply not there
+# once the trainer has booked its 5+ GB. There is no good second chance
+# through that wall; a spawn would just timeout-and-kill, which is what
+# happened twenty-two times in a row before this guard existed. Skipping
+# up-front with a clear log beats a 300 s park followed by a kill, and the
+# eval retry lands at the next ``--eval-every`` step by which point the
+# machine may have recovered (e.g. after a supervisor restart freed the
+# trainer's committed memory).
+MIN_AVAILABLE_GB = 2.5
+
 
 def work_directory(config_filepath: str) -> pathlib.Path:
     """A stable scratch directory, reused and overwritten on every eval.
@@ -289,6 +304,18 @@ def make_eval_hook(
 
         # Never let a failed worker hand back the previous eval's numbers.
         result_path.unlink(missing_ok=True)
+        # The worker's own log file, the same: if its python interpreter
+        # fails to start -- the real failure mode when system memory is
+        # gone -- it never reaches its own ``FileHandler(mode="w")`` and
+        # the file is left holding the previous successful eval's lines.
+        # ``worker_tail`` would then report those as "how far this worker
+        # got", which is exactly the lie every post-mortem here has been
+        # told. Truncated here, mirroring what the worker's own
+        # ``FileHandler(mode="w")`` would have done, so a hang in
+        # interpreter startup yields an honest "the worker's log is empty;
+        # it died before its first stage" rather than stale content two
+        # days old.
+        (directory / WORKER_LOG_FILE).write_text("", encoding="utf-8")
 
         torch.save(
             {
@@ -332,6 +359,35 @@ def make_eval_hook(
                 "Could not prepare the eval request at step %d; training "
                 "continues",
                 step,
+            )
+            return
+
+        # Check system memory *before* spawning. The hung-eval failure mode
+        # here is the worker's python interpreter never reaching its first
+        # log line because ``import torch`` next to a live trainer cannot
+        # get commit headroom once most of the machine is already booked. A
+        # spawn in that state parks for the full ``timeout`` and is killed
+        # by it; this guard turns that into an explicit skip with a clear
+        # line in the log. Per-call, not per-attempt: retries happen seconds
+        # apart, and memory in that window is whatever it is -- there is no
+        # second chance here for the spawn loop to find.
+        from . import host_memory
+
+        available = host_memory.available_gb()
+        if (
+            available is not None
+            and available < MIN_AVAILABLE_GB
+        ):
+            logger.warning(
+                "Skipping evaluation at step %d: only %.2f GB of physical "
+                "memory is free (need at least %.2f GB to start a second "
+                "python interpreter that imports torch alongside the "
+                "trainer). Eval will retry at the next --eval-every step. "
+                "Memory: %s.",
+                step,
+                available,
+                MIN_AVAILABLE_GB,
+                host_memory.snapshot(),
             )
             return
 

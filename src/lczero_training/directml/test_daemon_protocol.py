@@ -73,11 +73,65 @@ def test_optional_fields_default_to_none():
     line = _sent_line(TrainingMetricsPayload(step=7))
     handler = _Handler()
     Communicator(handler, io.StringIO(line), io.StringIO()).run()
+
     got = handler.received[0]
     assert got.step == 7
     assert got.losses is None
     assert got.grad_norm is None
     assert got.phase == TrainingPhase.STARTING.value
+
+
+def test_a_single_bad_line_does_not_kill_the_reader():
+    """The reader must survive a malformed line and keep going. A single
+    bad JSONL used to silently take down the AsyncCommunicator worker,
+    after which every later payload was dropped -- including all KDA
+    updates, which is what left the kda-health pane empty in the live TUI
+    while the daemon kept producing KDA stats. Reproduce by feeding one
+    unreadable line followed by a valid one and asserting both that the
+    bad line was discarded and that the good one still arrived.
+    """
+    payload = TrainingMetricsPayload(step=42, losses={"total": 1.5})
+    wire = (
+        "this is not json\n"
+        + _sent_line(payload)
+        + "{\"type\": \"unknown_event\", \"payload\": {}}\n"
+        + _sent_line(TrainingMetricsPayload(step=43, losses={"total": 1.6}))
+    )
+
+    handler = _Handler()
+    Communicator(handler, io.StringIO(wire), io.StringIO()).run()
+
+    # Both good lines delivered, in order; the two bad ones skipped.
+    assert [p.step for p in handler.received] == [42, 43]
+
+
+def test_kda_keys_survive_the_wire_round_trip():
+    """The KDA panel is empty in the live TUI despite the daemon emitting
+    KDA stats on every report step, so the path that has to actually
+    work is the one that delivers ``KDA/blockN <stat>`` keys through the
+    JSONL wire and into the handler. Dict keys with spaces survive
+    ``json.dumps``/``json.loads`` (JSON keys are strings), but a future
+    serializer change that turned them into something else would quietly
+    break the kda panel -- pin them here."""
+    losses = {
+        "KDA/block0 beta mean": 0.9594,
+        "KDA/block0 decay saturated %": 24.2703,
+        "KDA/block0 output gate mean": 0.9578,
+        "KDA/block0 output rms": 0.5138,
+        "KDA/block2 output gate mean": 0.9083,
+    }
+    line = _sent_line(
+        TrainingMetricsPayload(
+            phase=TrainingPhase.TRAINING.value, step=1, losses=losses
+        )
+    )
+    handler = _Handler()
+    Communicator(handler, io.StringIO(line), io.StringIO()).run()
+
+    got = handler.received[0]
+    for key, value in losses.items():
+        assert key in got.losses, f"{key!r} dropped on the wire"
+        assert got.losses[key] == pytest.approx(value)
 
 
 @pytest.mark.anyio

@@ -36,7 +36,8 @@ data_loader {
       output {
         queue_capacity: 16
       }
-      frame_format: V7TrainingData
+       #frame_format: V7TrainingData
+       frame_format: V6TrainingData
     }
   }
   stage {
@@ -73,7 +74,7 @@ data_loader {
       #
       # With --data-file-count this cap only has to exceed the window, so
       # an oversized value stays correct there too.
-      chunk_pool_size: 3600000
+      chunk_pool_size:  1371345
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {
@@ -206,7 +207,13 @@ training {
   }
   lr_schedule {
     duration_steps: 0
-    lr: 0.0001
+    # Bumped from 0.0001 on 2026-08-13: at effective batch 64 the policy head
+    # was statistically flat over ~78k steps (r=0.015 vs step), while value
+    # accuracy rose 78% -> 90% on the same lr. TF-era defaults sit in the
+    # 3e-4 -- 1e-3 range, so this is the conservative end of that. Revert if
+    # grad_norm spikes or the run diverges.
+    # droped lr to 0.00003 at step 339835 from 0.0003
+    lr: 0.00003
   }
   checkpoint {
     path: "C:/Users/Contrad/Documents/lc0-directml-checkpoint"
@@ -345,10 +352,6 @@ model {
     name: "vanilla"
     d_model: 128
   }
-  policy_head {
-    name: "optimistic_st"
-    d_model: 128
-  }
   value_head {
     name: "winner"
     num_channels: 64
@@ -371,7 +374,7 @@ model {
   }
 }
 metrics {
-  tensorboard_path: "C:/Users/Contrad/Documents/lc0-directml-tensorboard"
+  tensorboard_path: "C:/Users/Contrad/Documents/lc0-directml-tensorboard/kda-directml-native-train"
 }
 export {
   destination_filename: "C:/Users/Contrad/Documents/lc0-directml-networks/kda-native-{step}.pb.gz"

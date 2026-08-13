@@ -2,6 +2,7 @@
 # ABOUTME: Handles serialization/deserialization and message dispatch via stdin/stdout.
 
 import json
+import logging
 import types
 from dataclasses import is_dataclass
 from enum import Enum
@@ -12,6 +13,8 @@ from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.message import Message
 
 from .registry import CLASS_TO_TYPE_MAP, TYPE_TO_CLASS_MAP
+
+logger = logging.getLogger(__name__)
 
 
 def _to_serializable(obj: Any) -> Any:
@@ -125,17 +128,33 @@ class Communicator:
         if not line:
             return
 
-        data = json.loads(line)
-        event_type = data["type"]
-        payload_dict = data["payload"]
+        try:
+            data = json.loads(line)
+            event_type = data["type"]
+            payload_dict = data["payload"]
 
-        payload_cls = TYPE_TO_CLASS_MAP[event_type]
-        payload_instance = _from_serializable(payload_cls, payload_dict)
+            payload_cls = TYPE_TO_CLASS_MAP[event_type]
+            payload_instance = _from_serializable(payload_cls, payload_dict)
 
-        handler_method_name = f"on_{event_type}"
-        handler_method = getattr(self.handler, handler_method_name)
+            handler_method_name = f"on_{event_type}"
+            handler_method = getattr(self.handler, handler_method_name)
 
-        handler_method(payload_instance)
+            handler_method(payload_instance)
+        except Exception as error:
+            # A single bad line must not kill the whole read loop: the
+            # daemon emits many event types and the handler is allowed to
+            # lack one (e.g. a future daemon adds a payload this TUI does
+            # not know about), and the sync Communicator is used by tests
+            # that exercise individual messages on contrived inputs. Skip
+            # the line, log loudly, and keep reading -- a single malformed
+            # payload used to silently take down the worker, after which
+            # every later KDA/update message was dropped and the pane
+            # froze forever, with no visible evidence anywhere.
+            logger.exception(
+                "Discarding an unreadable JSONL line (%s): %r",
+                type(error).__name__,
+                line[:200],
+            )
 
     def run(self) -> None:
         """
@@ -198,17 +217,33 @@ class AsyncCommunicator:
         if not line:
             return
 
-        data = json.loads(line)
-        event_type = data["type"]
-        payload_dict = data["payload"]
+        try:
+            data = json.loads(line)
+            event_type = data["type"]
+            payload_dict = data["payload"]
 
-        payload_cls = TYPE_TO_CLASS_MAP[event_type]
-        payload_instance = _from_serializable(payload_cls, payload_dict)
+            payload_cls = TYPE_TO_CLASS_MAP[event_type]
+            payload_instance = _from_serializable(payload_cls, payload_dict)
 
-        handler_method_name = f"on_{event_type}"
-        handler_method = getattr(self.handler, handler_method_name)
+            handler_method_name = f"on_{event_type}"
+            handler_method = getattr(self.handler, handler_method_name)
 
-        await handler_method(payload_instance)
+            await handler_method(payload_instance)
+        except Exception as error:
+            # A single bad line must not end the reader loop. The daemon
+            # emits a long stream of messages and any one of them being
+            # malformed (corrupted pipe, unknown event type from a newer
+            # daemon, a deserializer that disagrees with this build) used
+            # to kill the worker silently -- Textual logs WorkerFailed to
+            # its own dev console, but the user-facing terminal keeps
+            # rendering stale panels forever, with nothing saying why.
+            # Catch, log loudly, keep reading: nothing visual changes when
+            # a metric is dropped, but the NEXT good line still arrives.
+            logger.exception(
+                "Discarding an unreadable JSONL line (%s): %r",
+                type(error).__name__,
+                line[:200],
+            )
 
     async def run(self) -> None:
         """

@@ -46,9 +46,9 @@ class DirectMlTrainingDaemon:
         target_step: Optional[int] = None,
         output: Optional[str] = None,
         eval_every: int = 0,
-        eval_batches: int = 50,
+        eval_batches: int = 20,
         eval_device: Optional[str] = None,
-        eval_timeout: float = 300.0,
+        eval_timeout: float = 600.0,
         eval_retries: int = 1,
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
@@ -56,6 +56,7 @@ class DirectMlTrainingDaemon:
         gc_every: int = 0,
         nan_check: str = "report",
         max_skips: int = 20,
+        ignore_config_mismatch: bool = False,
     ):
         self._config_filepath = config_filepath
         self._checkpoint_dir = checkpoint_dir
@@ -77,6 +78,7 @@ class DirectMlTrainingDaemon:
         self._gc_every = gc_every
         self._nan_check = nan_check
         self._max_skips = max_skips
+        self._ignore_config_mismatch = ignore_config_mismatch
 
         self._stop = threading.Event()
         self._communicator = Communicator(self, sys.stdin, sys.stdout)
@@ -398,7 +400,9 @@ class DirectMlTrainingDaemon:
         )
 
         restored = checkpoint_io.load_latest(
-            directory, expected_digest=checkpoint_io.config_digest(config)
+            directory,
+            expected_digest=checkpoint_io.config_digest(config),
+            ignore_config_mismatch=self._ignore_config_mismatch,
         )
         if restored is None:
             self._emit(
@@ -424,23 +428,58 @@ class DirectMlTrainingDaemon:
             config.training.gradient_accumulation_steps = self._grad_accum
 
         model, optimizer = build_model_and_optimizer(config, device)
-        model.load_state_dict(restored.model_state)
+        # Tolerate tensors the checkpoint has but this model no longer uses --
+        # e.g. a policy_head dropped from the config -- but never silently
+        # accept a checkpoint missing a tensor the model needs. See
+        # checkpoint.load_state_dict_into for the rationale behind splitting
+        # strict=False's "missing vs unexpected" check.
+        checkpoint_io.load_state_dict_into(model, restored.model_state)
         model.to(device)
+        optimizer_resumed = False
         if restored.optimizer_state is not None:
-            optimizer.load_state_dict(restored.optimizer_state)
-        else:
-            # A checkpoint with no moments -- the emergency save's last
-            # resort. Starting the moments at zero is unavoidable, but
-            # leaving their step counters at zero as well is not: the bias
-            # correction would treat a network at step 191000 as if it were
-            # on its first, and the first updates would be full-rate sign
-            # steps. Fast-forwarding the counters keeps them the size the
-            # schedule intends.
-            logger.warning(
-                "Checkpoint at step %d has no optimizer state; resuming "
-                "without momentum",
-                restored.step,
-            )
+            try:
+                checkpoint_io.load_optimizer_state_dict_into(
+                    optimizer,
+                    restored.optimizer_state,
+                    model,
+                    restored.model_state,
+                    config.training.optimizer.nadamw.decay_selector,
+                )
+                optimizer_resumed = True
+            except checkpoint_io.OptimizerStateMismatchError as error:
+                # The error's own message names this exact recovery.
+                # Known, expected cause: a checkpoint saved before
+                # training._state_dict_to_host's shared-parameter fix --
+                # every checkpoint saved with the pre-fix make_checkpoint
+                # hits this on every resume attempt, and crash-looping the
+                # supervisor forever over a condition with a well-defined,
+                # safe recovery helps no one. The weights themselves are
+                # unaffected -- this is only about the optimizer's
+                # per-parameter Adam moments -- and the next checkpoint
+                # this process saves will be self-consistent again.
+                logger.warning(
+                    "Checkpoint at step %d has optimizer state, but it "
+                    "cannot be paired to this model by name; resuming "
+                    "with fresh moments instead of failing the launch. "
+                    "%s",
+                    restored.step,
+                    error,
+                )
+        if not optimizer_resumed:
+            # A checkpoint with no usable moments -- either the emergency
+            # save's last resort (no optimizer_state at all) or the
+            # mismatch recovery above. Starting the moments at zero is
+            # unavoidable, but leaving their step counters at zero as well
+            # is not: the bias correction would treat a network at step
+            # 191000 as if it were on its first, and the first updates
+            # would be full-rate sign steps. Fast-forwarding the counters
+            # keeps them the size the schedule intends.
+            if restored.optimizer_state is None:
+                logger.warning(
+                    "Checkpoint at step %d has no optimizer state; "
+                    "resuming without momentum",
+                    restored.step,
+                )
             optimizer.set_step(restored.step)
 
         # One "segment" is a checkpoint interval; --target-step keeps the

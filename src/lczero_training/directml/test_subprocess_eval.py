@@ -18,6 +18,25 @@ from lczero_training.directml import subprocess_eval
 from lczero_training.directml.conftest import make_tiny_config
 
 
+@pytest.fixture(autouse=True)
+def _bypass_memory_guard(monkeypatch, request):
+    """Most tests here exercise the spawn mechanics, not the environmental
+    low-memory skip. They run on machines whose own free memory is whatever
+    it is -- the guard would fire on real-spawn tests for reasons that have
+    nothing to do with the code under test, exactly as it fired here once:
+    a CI box with 1.09 GB free where a tiny CPU worker spawns fine. Tests
+    that *do* want the guard mark themselves via ``request.node`` markers
+    or by not opting out below; the default for this module is bypass.
+
+    Importing here keeps the bypass in lockstep with the import: if a new
+    test forgets to override the guard it falls under the fixture."""
+    from lczero_training.directml import host_memory
+
+    marker = request.node.get_closest_marker("enable_memory_guard")
+    if marker is None:
+        monkeypatch.setattr(host_memory, "available_gb", lambda: None)
+
+
 class _FakeLoader:
     """Yields batches shaped like the real loader's ``test`` output.
 
@@ -60,6 +79,7 @@ def test_batches_round_trip_through_the_request_file(tmp_path):
 
 def _evaluate_through_a_real_worker(tmp_path, monkeypatch, device_spec):
     """Spawn the worker for real and return what came back."""
+    from lczero_training.directml import host_memory
     from lczero_training.directml.model import LczeroModel
 
     config = make_tiny_config()
@@ -414,3 +434,105 @@ def test_a_stale_result_is_never_reported_as_a_fresh_one(tmp_path, monkeypatch):
     hook(500)
 
     assert not (work / subprocess_eval.RESULT_FILE).exists()
+
+
+@pytest.mark.enable_memory_guard
+def test_low_memory_skips_eval_without_attempting_to_spawn(
+    tmp_path, monkeypatch, caplog
+):
+    """The hung-eval failure mode: the worker's python hangs at interpreter
+    startup once system memory is too low for a second ``import torch``
+    next to the trainer. Spawning in that state parks for the full
+    timeout and is killed -- exactly the 22 hangs in a row in
+    ``train-new.log`` before this guard existed. Skip up-front with a
+    clear log line instead of paying that."""
+    import logging
+
+    config = make_tiny_config()
+    spawned = []
+    monkeypatch.setattr(
+        subprocess_eval.subprocess,
+        "Popen",
+        lambda *a, **k: spawned.append(1) or pytest.fail("must not spawn"),
+    )
+    monkeypatch.setattr(
+        subprocess_eval, "work_directory", lambda _: tmp_path / "work"
+    )
+    from lczero_training.directml import host_memory
+
+    monkeypatch.setattr(host_memory, "available_gb", lambda: 1.2)
+    monkeypatch.setattr(
+        host_memory, "snapshot", lambda: "available 1.20 GB of 11.65"
+    )
+
+    hook = subprocess_eval.make_eval_hook(
+        config=config,
+        model=torch.nn.Linear(2, 2),
+        loader=_FakeLoader(batch=2),
+        config_filepath=str(tmp_path / "config.textproto"),
+        batch_count=1,
+        on_scalars=lambda step, scalars: pytest.fail("should not report"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        hook(7001)
+
+    assert spawned == [], "low memory must skip the spawn, not pay the timeout"
+    assert any(
+        "Skipping evaluation at step 7001" in record.message
+        and "1.20 GB" in record.message
+        for record in caplog.records
+    ), "the skip reason must say which step and how much memory"
+
+
+@pytest.mark.enable_memory_guard
+def test_prepare_truncates_a_stale_worker_log_so_worker_tail_does_not_lie(
+    tmp_path, monkeypatch, caplog
+):
+    """A worker that hangs at interpreter startup never reaches its own
+    ``FileHandler(mode="w")``, so the parent has to truncate ``worker.log``
+    itself. Otherwise ``worker_tail`` would report the previous successful
+    eval's log lines as if the new worker had reached them -- which is
+    exactly the misleading ``I0808 18:12 ... Evaluated step 195000`` block
+    that appeared under every hung-eval post-mortem for a full week.
+
+    Reproduces by leaving stale content behind, running the hook under the
+    memory-starved path (which exits before any spawn), and confirming the
+    file is left empty rather than stale."""
+    import logging
+
+    config = make_tiny_config()
+    work = tmp_path / "work"
+    work.mkdir()
+    stale = "I9999 99:99:99 ... Evaluated step 12345 over 50 batch(es) ...\n"
+    (work / subprocess_eval.WORKER_LOG_FILE).write_text(stale, encoding="utf-8")
+    monkeypatch.setattr(subprocess_eval, "work_directory", lambda _: work)
+    from lczero_training.directml import host_memory
+
+    monkeypatch.setattr(host_memory, "available_gb", lambda: 0.4)
+
+    hook = subprocess_eval.make_eval_hook(
+        config=config,
+        model=torch.nn.Linear(2, 2),
+        loader=_FakeLoader(batch=2),
+        config_filepath=str(tmp_path / "config.textproto"),
+        batch_count=1,
+        on_scalars=lambda step, scalars: pytest.fail("should not report"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        hook(8000)
+
+    # Stale content has to be gone before the next "worker got this far"
+    # message can be believed. Empty (rather than absent) is fine: the
+    # FileHandler would have truncated to empty if the worker had reached
+    # it, and the diagnostic's empty-log branch handles that case honestly.
+    fresh = (work / subprocess_eval.WORKER_LOG_FILE).read_text(
+        encoding="utf-8"
+    )
+    assert "Evaluated step" not in fresh, (
+        "the stale line from the previous successful eval must not survive "
+        "into the next attempt's worker.log; a hung interpreter never "
+        "truncates it itself, so prepare() does"
+    )
+    assert fresh == "", "prepare() leaves the file empty, not absent"

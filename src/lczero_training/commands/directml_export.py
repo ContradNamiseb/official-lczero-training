@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("Exporting checkpoint at step %d", restored.step)
 
     model = LczeroModel(config.model)
-    model.load_state_dict(restored.model_state)
+    checkpoint_io.load_state_dict_into(model, restored.model_state)
     model.eval()
 
     net = torch_to_leela(
