@@ -272,6 +272,15 @@ def train(
         optimizer.zero_grad(set_to_none=True)
 
         metrics: dict[str, float] = {}
+        # Accumulated across every micro-batch in this step (not just the
+        # last), so "Policy Accuracy"/"Value Accuracy" read from the whole
+        # effective batch -- see derived_metrics.policy_accuracy_counts and
+        # .value_accuracy_counts. Left at 0 when diagnostics are off or this
+        # step isn't reporting, so the loop below costs nothing extra then.
+        policy_correct = 0
+        policy_total = 0
+        value_correct = 0
+        value_total = 0
         for micro in range(accumulation):
             final_micro = micro == accumulation - 1
             # Only the last micro-batch carries the diagnostics, so the KDA
@@ -297,6 +306,36 @@ def train(
                     warmup_seconds,
                 )
             predictions = model(batch.inputs)
+
+            if diagnostics and (should_log or should_report):
+                # Cheap (argmax + compare, no softmax entropy/search-loss
+                # work): safe to run on every micro-batch, unlike the fuller
+                # policy_metrics()/value_metrics() calls below, which stay
+                # last-micro-batch-only so MSE Loss etc. aren't recomputed
+                # `accumulation` times over for numbers that get thrown away.
+                for policy_loss in loss_fn.policy_losses:
+                    logits = predictions.policy.get(policy_loss.head_name)
+                    if logits is None:
+                        continue
+                    correct, count = derived_metrics.policy_accuracy_counts(
+                        batch.probabilities, logits
+                    )
+                    policy_correct += correct
+                    policy_total += count
+                    break
+                for value_loss in loss_fn.value_losses:
+                    prediction = predictions.value.get(value_loss.head_name)
+                    if prediction is None:
+                        continue
+                    correct, count = derived_metrics.value_accuracy_counts(
+                        prediction[0],
+                        batch.values[:, value_loss.value_type, 0],
+                        batch.values[:, value_loss.value_type, 1],
+                    )
+                    value_correct += correct
+                    value_total += count
+                    break
+
             loss, micro_metrics = loss_fn(predictions, batch, model)
             # Divided so the accumulated gradient is the mean over the
             # effective batch, not its sum -- otherwise the update would
@@ -337,6 +376,14 @@ def train(
             for name, value in diag_metrics.items():
                 metrics[name] = float(value)
             del diag_metrics
+            # Overrides the single-micro-batch values _diagnostic_metrics
+            # just set above with the whole-effective-batch ones.
+            if policy_total:
+                metrics["Policy Accuracy"] = (
+                    policy_correct / policy_total * 100.0
+                )
+            if value_total:
+                metrics["Value Accuracy"] = value_correct / value_total * 100.0
         del predictions
 
         if max_grad_norm and max_grad_norm > 0:

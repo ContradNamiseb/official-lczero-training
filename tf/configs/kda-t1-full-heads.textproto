@@ -1,0 +1,420 @@
+# kda-t1's body (same 128x4 net, same data pipeline, same memory-tuned
+# batch/accumulation -- this is the proven-working "this PC" scale, smoke
+# tested at C:/Users/Contrad/Documents/lc0-kda-t1) with the fuller
+# policy/value/movesleft head set from your production config layered on
+# top, at this PC's size instead of that config's 1024x15.
+#
+# Three things from that reference config are deliberately NOT here --
+# checked against this repo's actual proto/*.proto, not assumed:
+#   - freeze_selector: src/lczero_training/directml/optimizer.py raises
+#     NotImplementedError if this field is present at all (HasField, not
+#     its contents) -- not ported to the DirectML trainer yet.
+#   - swa: no code anywhere under src/lczero_training/directml reads
+#     training.swa. Including it would parse fine and silently do nothing,
+#     which is worse than a config that admits it isn't there.
+#   - the "progress" movesleft head (PLIES_UNTIL_PROGRESS): this proto's
+#     MovesLeftLossConfig has no `component` field at all -- head_name,
+#     metric_name, weight, value_type, full stop. There is no way to tell
+#     this schema's movesleft loss apart from "main"'s, so a second head
+#     would just be a redundant copy of the same target, not a distinct
+#     plies-until-progress prediction. Dropped rather than shipped as a
+#     no-op.
+# Everything else here -- optimistic policy, KL loss, value_error,
+# value_categorical -- IS implemented on this trainer (see losses.py); the
+# real stuck run's own checkpoint already had an "optimistic_st" parameter
+# in it, so that specific head is proven, not a guess.
+
+data_loader {
+  stage {
+    name: "file_path_provider"
+    file_path_provider {
+      directory: "C:/Users/Contrad/Documents/training-data/k2hybrid-bt4tf13g-v7op1"
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "chunk_source_loader"
+    input: "file_path_provider"
+    chunk_source_loader {
+      # Same reasoning as kda-t1.textproto: 4 threads matches this
+      # machine's 4 physical cores, and more only helps startup indexing,
+      # not steady-state (the loader is GPU-bound once training starts).
+      threads: 4
+      output {
+        queue_capacity: 16
+      }
+      frame_format: V6TrainingData
+    }
+  }
+  stage {
+    name: "chunk_source_splitter"
+    input: "chunk_source_loader"
+    chunk_source_splitter {
+      output {
+        name: "train"
+        queue_capacity: 16
+      }
+      output {
+        name: "test"
+        queue_capacity: 1
+      }
+      weight: 99
+      weight: 1
+    }
+  }
+  stage {
+    name: "train_shuffling_chunk_pool"
+    input: "chunk_source_splitter.train"
+    shuffling_chunk_pool {
+      # Same corpus, same window as kda-t1.textproto -- see that file's
+      # comment if this ever needs to change: it must stay ABOVE the tar
+      # count, and dropping it silently trims the corpus with no error.
+      chunk_pool_size: 1371345
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_chunk_rescorer"
+    input: "train_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "train_chunk_unpacker"
+    input: "train_chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.5
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_shuffling_frame_sampler"
+    input: "train_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 5000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "train_tensor_generator"
+    input: "train_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 2
+      batch_size: 16
+      output {
+        queue_capacity: 4
+      }
+    }
+  }
+  stage {
+    name: "test_shuffling_chunk_pool"
+    input: "chunk_source_splitter.test"
+    shuffling_chunk_pool {
+      chunk_pool_size: 3600000
+      source_ingestion_threads: 1
+      chunk_loading_threads: 4
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_chunk_rescorer"
+    input: "test_shuffling_chunk_pool"
+    chunk_rescorer {
+      threads: 1
+      output {
+        queue_capacity: 16
+      }
+      dist_temp: 1.0
+      dist_offset: 0.0
+      dtz_boost: 0.0
+      new_input_format: -1
+      deblunder_threshold: 0.1
+      deblunder_width: 0.06
+    }
+  }
+  stage {
+    name: "test_chunk_unpacker"
+    input: "test_chunk_rescorer"
+    chunk_unpacker {
+      threads: 1
+      position_sampling_rate: 0.5
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_shuffling_frame_sampler"
+    input: "test_chunk_unpacker"
+    shuffling_frame_sampler {
+      threads: 1
+      reservoir_size_per_thread: 1000
+      output {
+        queue_capacity: 16
+      }
+    }
+  }
+  stage {
+    name: "test_tensor_generator"
+    input: "test_shuffling_frame_sampler"
+    tensor_generator {
+      threads: 1
+      batch_size: 32
+      output {
+        queue_capacity: 8
+      }
+    }
+  }
+  output: "train:train_tensor_generator"
+  output: "test:test_tensor_generator"
+}
+
+training {
+  schedule {
+    steps_per_network: 1000
+    chunks_per_network: 500
+  }
+  lr_schedule {
+    duration_steps: 0
+    # Flat, matching kda-t1.textproto's current rate rather than a fresh
+    # warmup -- same body, same machine, no evidence yet that this head set
+    # needs a different rate. Watch grad_norm and Policy Entropy on the new
+    # heads (optimistic_st, soft, opponent) early: they start from random
+    # init even though the tower may eventually be importable from a
+    # kda-t1 export, and a flat rate this low trains a random head slowly.
+    lr: 0.00003
+  }
+  checkpoint {
+    # Separate directory from kda-t1 -- this has three more heads than that
+    # net's checkpoint, so the state dicts are not interchangeable.
+    path: "C:/Users/Contrad/Documents/lc0-kda-t1-full-heads"
+    max_to_keep: 100
+  }
+  optimizer {
+    nadamw {
+      beta_1: 0.9
+      beta_2: 0.98
+      epsilon: 1e-07
+      weight_decay: 0.0001
+      decay_selector {
+        rule {
+          match: "**/bias"
+        }
+        rule {
+          match: "**/ln*/**"
+        }
+        rule {
+          match: "**/embedding/embedding/**"
+        }
+        rule {
+          match: "**/policy_heads/**"
+          include: true
+        }
+        rule {
+          match: "**/value_heads/**"
+          include: true
+        }
+        rule {
+          match: "**/movesleft_heads/**"
+          include: true
+        }
+      }
+    }
+  }
+  losses {
+    policy {
+      head_name: "vanilla"
+      metric_name: "main_ce"
+      weight: 1.0
+      illegal_moves: MASK
+      type: KL
+    }
+    policy {
+      head_name: "optimistic_st"
+      weight: 1.0
+      illegal_moves: MASK
+      type: KL
+      optimistic {
+        value_head_name: "st"
+        value_type: ST
+        strength: 2.0
+        eps: 1e-5
+        alpha: 5
+      }
+    }
+    policy {
+      head_name: "soft"
+      weight: 8.0
+      illegal_moves: MASK
+      type: KL
+      temperature: 4.0
+    }
+    value {
+      head_name: "winner"
+      weight: 1.0
+    }
+    value {
+      head_name: "q"
+      weight: 1.0
+      value_type: BEST
+    }
+    value_error {
+      head_name: "q"
+      weight: 1.0
+      value_type: BEST
+    }
+    value_categorical {
+      head_name: "q"
+      weight: 0.1
+      value_type: BEST
+    }
+    value {
+      head_name: "st"
+      weight: 1.0
+      value_type: ST
+    }
+    value_error {
+      head_name: "st"
+      weight: 1.0
+      value_type: ST
+    }
+    value_categorical {
+      head_name: "st"
+      weight: 0.1
+      value_type: ST
+    }
+    movesleft {
+      head_name: "main"
+      weight: 1.0
+    }
+  }
+  # Unchanged from kda-t1.textproto: this machine's own measured spike
+  # history (steady-state grad_norm ~5-6, a survivable spike to 11, one
+  # unclipped spike at 16 that overflowed to NaN and stalled a run for a
+  # day). More heads adds more loss terms into the same clip, not a reason
+  # to raise it on its own -- watch for it clipping every step, which would
+  # mean it needs raising, not that this number was wrong to reuse.
+  max_grad_norm: 8.0
+  # Unchanged from kda-t1.textproto: same 32-batch OOM ceiling on this
+  # Iris Xe, same reason accumulation must stay 4 and never drop to 1 (see
+  # that file's comment on RSS churn under NAdamW). Three extra heads add
+  # parameters and per-step activations; if this OOMs where kda-t1 didn't,
+  # that is the extra heads' memory, not a reason to disbelieve the
+  # original comment -- drop tensor_generator.batch_size before touching
+  # accumulation.
+  gradient_accumulation_steps: 4
+}
+
+model {
+  defaults {
+    compute_dtype: F32
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+  embedding {
+    dense_size: 64
+    embedding_size: 128
+    dff: 128
+  }
+  encoder {
+    num_blocks: 4
+    dff: 128
+    d_model: 128
+    heads: 8
+    smolgen {
+      hidden_channels: 8
+      hidden_size: 32
+      gen_size: 32
+      activation: ACTIVATION_SWISH
+    }
+    kda {
+      key_dim: 32
+      value_dim: 32
+      gate_rank: 32
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+    }
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_MHA
+  }
+  shared_policy_embedding_size: 128
+  policy_head {
+    name: "vanilla"
+    d_model: 128
+  }
+  policy_head {
+    name: "optimistic_st"
+    d_model: 128
+  }
+  policy_head {
+    name: "soft"
+    d_model: 128
+  }
+  policy_head {
+    name: "opponent"
+    d_model: 128
+  }
+  value_head {
+    name: "winner"
+    num_channels: 64
+  }
+  value_head {
+    name: "q"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  value_head {
+    name: "st"
+    num_channels: 64
+    has_error_output: true
+    num_categorical_buckets: 16
+  }
+  movesleft_head {
+    name: "main"
+    num_channels: 32
+  }
+}
+
+metrics {
+  tensorboard_path: "C:/Users/Contrad/Documents/lc0-kda-t1-full-heads/kda-t1-full-heads-train"
+}
+
+export {
+  destination_filename: "C:/Users/Contrad/Documents/lc0-directml-networks/kda-t1-full-heads-{step}.pb.gz"
+}

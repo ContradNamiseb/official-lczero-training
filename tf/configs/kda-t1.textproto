@@ -1,4 +1,4 @@
-name: "kda-directml-native"
+name: "kda-t1"
 data_loader {
   stage {
     name: "file_path_provider"
@@ -212,23 +212,12 @@ training {
     # accuracy rose 78% -> 90% on the same lr. TF-era defaults sit in the
     # 3e-4 -- 1e-3 range, so this is the conservative end of that. Revert if
     # grad_norm spikes or the run diverges.
-    #
-    # Dropped to 0.00003 at step 339835 during the same-day config-switch
-    # crash loop -- that was a panic move made mid-incident, not a response
-    # to the loss actually diverging (grad_norm stayed a steady 3-9 through
-    # the whole window, never spiked). Restored to 0.0003 on 2026-08-15: the
-    # held-out test-set policy loss has been flat (2.19-2.28) from step
-    # ~180000 all the way through the current step (356336+, confirmed via
-    # both Old-tensorboard and the live tensorboard dir), i.e. the plateau
-    # long predates and outlasts this LR, so 0.00003 was never given a fair
-    # chance to fix anything -- it just added 16.5k more flat steps at a
-    # rate 10x below what was already failing to move the needle. Revert if
-    # grad_norm spikes or the run diverges.
-    lr: 0.0003
+    # raised lr to 0.003 from 0.00003 at step 13050.
+    lr: 0.00003
   }
   checkpoint {
-    path: "C:/Users/Contrad/Documents/lc0-directml-checkpoint"
-    max_to_keep: 10
+    path: "C:/Users/Contrad/Documents/lc0-kda-t1-checkpoints"
+    max_to_keep: 100
   }
   optimizer {
     nadamw {
@@ -268,7 +257,7 @@ training {
       weight: 1.0
       illegal_moves: MASK
       type: CROSS_ENTROPY
-      #temperature: 2.0   # <--- Set higher PST here (e.g. 1.5, 2.0, or 2.5)
+      temperature: 2.0   # <--- Set higher PST here (e.g. 1.5, 2.0, or 2.5)
     }
     value {
       head_name: "winner"
@@ -385,8 +374,8 @@ model {
   }
 }
 metrics {
-  tensorboard_path: "C:/Users/Contrad/Documents/lc0-directml-tensorboard/kda-directml-native-train"
+  tensorboard_path: "C:/Users/Contrad/Documents/lc0-kda-t1/kda-t1-train"
 }
 export {
-  destination_filename: "C:/Users/Contrad/Documents/lc0-directml-networks/kda-native-{step}.pb.gz"
+  destination_filename: "C:/Users/Contrad/Documents/lc0-directml-networks/kda-t1-{step}.pb.gz"
 }

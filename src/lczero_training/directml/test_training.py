@@ -12,6 +12,7 @@ optax = pytest.importorskip("optax")
 import jax.numpy as jnp
 from google.protobuf import text_format
 
+from lczero_training.directml import derived_metrics
 from lczero_training.directml.losses import LczeroLoss
 from lczero_training.directml.optimizer import NAdamW, selector_includes
 from lczero_training.directml.training import training_segments
@@ -846,6 +847,128 @@ def test_reported_metrics_average_over_the_micro_batches():
     assert reported == pytest.approx(sum(per_micro) / len(per_micro), rel=1e-4)
     # And it is genuinely an average, not just the final micro-batch.
     assert reported != pytest.approx(per_micro[-1], rel=1e-6)
+
+
+def test_policy_accuracy_counts_masks_illegal_moves():
+    """The pure counting function `policy_metrics()`'s "Policy Accuracy" and
+    training.py's per-micro-batch accumulation both build on: illegal moves
+    (negative target) must not count as the search's choice, matching
+    `_correct_policy`'s masking, and the returned total is the sample count,
+    not the move-vocabulary size."""
+    target = torch.tensor(
+        [
+            [0.8, 0.2, -1.0, -1.0],  # legal-move argmax at index 0 (correct)
+            [-1.0, 0.3, 0.7, -1.0],  # legal-move argmax at index 2 (wrong)
+        ]
+    )
+    output = torch.tensor(
+        [
+            [5.0, 1.0, 100.0, 100.0],  # would pick index 2/3, but those are
+            # illegal here and must be masked out before comparing
+            [1.0, 2.0, 3.0, 4.0],  # picks index 3, illegal -> masked -> not
+            # the argmax after masking; index 1 becomes the model's pick
+        ]
+    )
+    correct, total = derived_metrics.policy_accuracy_counts(target, output)
+    assert total == 2
+    # Row 0: masked output argmax is index 0 (5.0 > 1.0 among legal {0,1}),
+    # target argmax is index 0 -> correct.
+    # Row 1: masked output argmax is index 2 (among legal {1,2},
+    # output[1]=2.0 < output[2]=3.0), target argmax is index 2 -> correct.
+    assert correct == 2
+
+
+def test_value_accuracy_counts_matches_wdl_argmax():
+    """The pure counting function backing "Value Accuracy": correct iff the
+    predicted WDL bucket (win/draw/loss argmax) matches the target's."""
+    # q, d encode target WDL as (win, draw, loss) = ((1+q-d)/2, d, (1-q-d)/2).
+    # Row 0: q=1, d=0 -> (1, 0, 0), a clear win target.
+    # Row 1: q=-1, d=0 -> (0, 0, 1), a clear loss target.
+    q = torch.tensor([1.0, -1.0])
+    d = torch.tensor([0.0, 0.0])
+    wdl_logits = torch.tensor(
+        [
+            [5.0, 0.0, 0.0],  # predicts win -> matches row 0's win target
+            [5.0, 0.0, 0.0],  # predicts win -> row 1's target is loss, wrong
+        ]
+    )
+    correct, total = derived_metrics.value_accuracy_counts(wdl_logits, q, d)
+    assert total == 2
+    assert correct == 1
+
+
+def test_policy_and_value_accuracy_pool_across_micro_batches():
+    """"Policy Accuracy" and "Value Accuracy" must both read from the whole
+    effective batch, not just the last micro-batch -- otherwise, at
+    gradient_accumulation_steps=4, they're quantized to whatever a
+    1/batch_size denominator gives (1/16 at this trainer's real batch size)
+    and swing tens of points step to step on pure sampling noise, easy to
+    misread as the run itself being unstable.
+
+    Both counting functions are monkeypatched to deterministic, increasing
+    per-call counts: a tiny randomly-initialized model matches an untrained
+    argmax by chance so rarely (~1/1858 for policy) that "pooled" and
+    "last-micro-batch-only" would almost always be trivially equal (both
+    zero), defeating the point of this test -- it needs to tell them apart.
+    """
+    from lczero_training.directml.model import LczeroModel
+    from lczero_training.directml.training import train
+
+    config = _tiny_training_config()
+    config.training.gradient_accumulation_steps = 4
+    micro = _fixed_batches(4, 8, seed=13)
+
+    policy_calls = iter([(2, 8), (4, 8), (6, 8), (8, 8)])
+    value_calls = iter([(1, 8), (3, 8), (5, 8), (7, 8)])
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        derived_metrics,
+        "policy_accuracy_counts",
+        lambda *a, **k: next(policy_calls),
+    )
+    monkeypatch.setattr(
+        derived_metrics,
+        "value_accuracy_counts",
+        lambda *a, **k: next(value_calls),
+    )
+    try:
+        seen: list[dict] = []
+        torch.manual_seed(1234)
+        model = LczeroModel(config.model)
+        optimizer = NAdamW(
+            [{"params": list(model.parameters()), "weight_decay": 0.0}],
+            lr=0.0,
+        )
+        train(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            batches=iter(micro),
+            device=torch.device("cpu"),
+            start_step=0,
+            steps=1,
+            log_every=0,
+            reporters=[lambda step, scalars: seen.append(scalars)],
+            report_every=1,
+            diagnostics=True,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert len(seen) == 1
+    reported_policy = seen[0]["Policy Accuracy"]
+    reported_value = seen[0]["Value Accuracy"]
+
+    # (2+4+6+8) correct out of (8*4) total, pooled across all 4 calls.
+    assert reported_policy == pytest.approx(20 / 32 * 100.0, rel=1e-6)
+    # Not just the last micro-batch's own accuracy (8/8 = 100%), which the
+    # old last-micro-batch-only behavior would have reported instead.
+    assert reported_policy != pytest.approx(100.0, rel=1e-6)
+
+    # (1+3+5+7) correct out of (8*4) total, pooled across all 4 calls.
+    assert reported_value == pytest.approx(16 / 32 * 100.0, rel=1e-6)
+    # Not just the last micro-batch's own accuracy (7/8 = 87.5%).
+    assert reported_value != pytest.approx(7 / 8 * 100.0, rel=1e-6)
 
 
 def test_accumulation_metrics_are_host_floats():

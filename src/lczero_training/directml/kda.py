@@ -326,6 +326,8 @@ class KdaMixer(nn.Module):
         )
 
         self.heads = heads
+        self.directions = directions
+        self.heads_per_direction = heads // len(directions)
         self.key_dim = config.key_dim
         self.value_dim = config.value_dim
         self.gate_rank = config.gate_rank
@@ -384,6 +386,23 @@ class KdaMixer(nn.Module):
         self.collect_stats = False
         self.last_stats: dict[str, torch.Tensor] = {}
 
+        # A SEPARATE flag from collect_stats, and deliberately never set by
+        # the training loop: this one stashes the *undetached* value
+        # projection and mixer output (board-square order, pre rms_norm/
+        # gate/output_dense), so an interpretability tool can backprop
+        # through them afterwards (see chessformer_lens's LczeroEngine.
+        # kda_attention -- the recurrence is linear in value for fixed
+        # query/key/decay/beta, so d(mixed)/d(value) is an exact,
+        # non-approximate "effective attention matrix", the same identity
+        # real softmax attention weights satisfy). Keeping this off the
+        # collect_stats path matters: collect_stats already runs on every
+        # real training report step, and holding an undetached tensor (and
+        # the graph behind it) alive there would be a production memory
+        # regression for a feature training never uses.
+        self.collect_attention_target = False
+        self.last_value: torch.Tensor | None = None
+        self.last_mixed: torch.Tensor | None = None
+
         scan_order, scan_inverse = _build_scan_permutation(directions, heads)
         # Buffers, not parameters: static lookup tables that .to(device)
         # must follow the module but that no optimizer may ever touch.
@@ -399,6 +418,10 @@ class KdaMixer(nn.Module):
         query = self.q(proj_input).reshape(shape)
         key = self.k(proj_input).reshape(shape)
         value = self.v(proj_input).reshape(shape)
+        if self.collect_attention_target:
+            # Undetached, deliberately: kda_attention() backprops through
+            # this into `last_mixed` below to get an exact Jacobian.
+            self.last_value = value
 
         raw_decay = self.decay_b(self.decay_a(proj_input)).reshape(shape)
         log_decay = self.log_decay(raw_decay)
@@ -444,6 +467,13 @@ class KdaMixer(nn.Module):
         )
 
         mixed = self._scan_permute(ordered_out, forward=False)
+        if self.collect_attention_target:
+            # (batch, 64, heads, value_dim), board-square order, still
+            # linear in last_value at this point -- captured before
+            # rms_norm/gate/output_dense so it lines up with what MHA's own
+            # `attention @ value` represents (mixing only, no output
+            # projection folded in).
+            self.last_mixed = mixed
         mixed = mixed.reshape(batch, BOARD_SQUARES, self.heads * self.value_dim)
 
         if self.rms_norm is not None:

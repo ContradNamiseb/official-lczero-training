@@ -95,6 +95,53 @@ def policy_metrics(
     return metrics
 
 
+def policy_accuracy_counts(
+    target: torch.Tensor, output: torch.Tensor
+) -> tuple[int, int]:
+    """(correct, total) for one micro-batch, the same masking `policy_metrics`
+    uses for "Policy Accuracy" but without the softmax/entropy/search-loss
+    work that metric alone doesn't need.
+
+    Every micro-batch in a gradient-accumulation step is a real, independent
+    slice of the effective batch -- reporting "Policy Accuracy" from just the
+    last one (as the single `policy_metrics()` call in training.py's
+    diagnostics still does, for the other, costlier policy metrics) measures
+    accuracy on 1/accumulation of the samples that step actually trained on.
+    At gradient_accumulation_steps=4 and this trainer's batch size, that's 16
+    samples -- accuracy quantized to 1/16 and swinging +-20 points step to
+    step on sampling noise alone, easy to misread as instability. Callers
+    accumulate this cheap (correct, total) pair across all micro-batches in
+    the step and derive accuracy from the sum, so the reported number reads
+    from the whole 64-sample effective batch instead.
+    """
+    target, output = _correct_policy(target, output)
+    correct = (target.argmax(dim=1) == output.argmax(dim=1)).sum()
+    return int(correct), int(target.shape[0])
+
+
+def value_accuracy_counts(
+    wdl_logits: torch.Tensor, q: torch.Tensor, d: torch.Tensor
+) -> tuple[int, int]:
+    """(correct, total) for one micro-batch's value head -- the same
+    argmax-over-WDL comparison `value_metrics` uses for "Value Accuracy",
+    without also computing MSE Loss (that one stays last-micro-batch-only,
+    same scope as the policy-only fix in training.py). WDL is 3-wide, so
+    this is smaller and cheaper than policy_accuracy_counts, not bigger --
+    safe to accumulate across every micro-batch the same way.
+    """
+    target = torch.stack(
+        [
+            (torch.ones_like(q) + q - d) / 2.0,
+            d,
+            (torch.ones_like(q) - q - d) / 2.0,
+        ],
+        dim=-1,
+    )
+    predicted = torch.softmax(wdl_logits, dim=-1)
+    correct = (predicted.argmax(dim=-1) == target.argmax(dim=-1)).sum()
+    return int(correct), int(target.shape[0])
+
+
 def value_metrics(
     wdl_logits: torch.Tensor, q: torch.Tensor, d: torch.Tensor
 ) -> dict[str, torch.Tensor]:

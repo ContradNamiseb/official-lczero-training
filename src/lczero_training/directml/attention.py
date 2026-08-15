@@ -51,6 +51,11 @@ class Smolgen(nn.Module):
         self.activation = layers.get_activation(
             config.activation or defaults.activation
         )
+        # Same opt-in pattern as KdaMixer.collect_stats/last_stats: off by
+        # default so a normal training step pays nothing, populated for
+        # interpretability tooling (chessformer_lens) that flips it on.
+        self.collect_stats = False
+        self.last_bias: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, 64, in_features) -> (batch, heads, 64, 64).
@@ -60,7 +65,10 @@ class Smolgen(nn.Module):
         generated = self.ln2(self.activation(self.dense2(hidden)))
         generated = generated.reshape(batch, self.heads, -1)
         out = self.weight_gen_dense(generated)
-        return out.reshape(batch, self.heads, BOARD_SQUARES, BOARD_SQUARES)
+        out = out.reshape(batch, self.heads, BOARD_SQUARES, BOARD_SQUARES)
+        if self.collect_stats:
+            self.last_bias = out.detach()
+        return out
 
 
 class MultiHeadAttention(nn.Module):
@@ -106,6 +114,12 @@ class MultiHeadAttention(nn.Module):
         else:
             self.smolgen = None
 
+        # Same opt-in pattern as KdaMixer.collect_stats/last_stats (see
+        # attention_widget-style tooling in chessformer_lens): off by
+        # default, so a normal training step allocates nothing extra.
+        self.collect_stats = False
+        self.last_attention: dict[str, torch.Tensor] = {}
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
 
@@ -118,12 +132,23 @@ class MultiHeadAttention(nn.Module):
         key = to_heads(self.k(x))
         value = to_heads(self.v(x))
 
-        logits = query @ key.transpose(-1, -2)
-        logits = logits / math.sqrt(self.head_depth)
+        qk_logits = query @ key.transpose(-1, -2)
+        qk_logits = qk_logits / math.sqrt(self.head_depth)
+        logits = qk_logits
         if self.smolgen is not None:
             logits = logits + self.smolgen(x)
 
         attention = torch.softmax(logits, dim=-1)
+        if self.collect_stats:
+            # qk_logits: the raw scaled QKᵀ score, before any smolgen bias --
+            # the "semantic" half of chessformer_lens's QKᵀ/GAB split.
+            # smolgen_bias is captured on Smolgen itself (self.smolgen.last_bias)
+            # when the same flag propagates there; attention is what the model
+            # actually ran, post softmax, post bias.
+            self.last_attention = {
+                "qk_logits": qk_logits.detach(),
+                "attention": attention.detach(),
+            }
         out = attention @ value
         out = out.permute(0, 2, 1, 3).reshape(batch, BOARD_SQUARES, self.depth)
         return self.output_dense(out)
