@@ -14,6 +14,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -83,11 +84,14 @@ std::vector<float> CollectWeights(const fs::path& tar_path,
 
     if (chunk->empty()) continue;
 
-    for (const auto& entry : *chunk) {
-      const float weight = ComputePositionSamplingWeight(entry, config);
+    // Indexed rather than iterated: the weight of a position can depend on
+    // its neighbours in the same game.
+    const std::span<const FrameType> span(*chunk);
+    for (size_t i = 0; i < span.size(); ++i) {
+      const float weight = ComputePositionSamplingWeight(span, i, config);
       weights.push_back(weight);
       if (max_weighted && weight > max_weighted->weight) {
-        max_weighted->data = entry;
+        max_weighted->data = span[i];
         max_weighted->weight = weight;
       }
     }

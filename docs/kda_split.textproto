@@ -3,7 +3,29 @@ data_loader {
   stage {
     name: "file_path_provider"
     file_path_provider {
-      directory: "C:/Users/Contrad/Documents/training-data/k2hybrid-bt4tf13g-v7op1"
+      # Fishtest supervised set: 2,002,208 games converted with
+      # -pgn-eval-mode -wdl-scale 1.3 -visit-budget 850, then rescored
+      # against 3-4-5 Syzygy. One game per chunk, 6,000 per directory
+      # across 334 of them (fishtest-see-0 .. fishtest-see-333, the last
+      # holding 4,208) -- matching the -chunks-per-dir 6000 used at
+      # conversion. The provider recurses, and the loader maps .gz to
+      # RawFileChunkSource and .tar to TarChunkSource, so both work from
+      # the same directory setting.
+      #
+      # The same corpus exists in two shapes, and either can be used here:
+      #   .../Fishtest-SEE        loose .gz in 334 subdirectories
+      #   .../Fishtest-SEE-tars   the same games packed as 334 .tar (50 GB)
+      #
+      # Counts corrected 2026-08-25. This comment previously read "1,393,183
+      # games ... 5,000 files per subdirectory across 285" -- none of which
+      # matched the corpus on disk, and chunk_pool_size below had been sized
+      # from those wrong numbers. Verify against the corpus's convert.log
+      # rather than this comment if they ever disagree again.
+      #
+      # Previous corpus (345 tars, 89 GB) if you want to switch back:
+      # directory: "C:/Users/Contrad/Documents/training-data/k2hybrid-bt4tf13g-v7op1"
+      # directory: "C:/Users/Contrad/Documents/training-data/fishtest-archives"
+	  directory: "C:/Users/Contrad/Documents/training-data/Fishtest-SEE-tars"
       output {
         queue_capacity: 16
       }
@@ -74,36 +96,207 @@ data_loader {
       #
       # With --data-file-count this cap only has to exceed the window, so
       # an oversized value stays correct there too.
-      chunk_pool_size:  1371345
+      #
+      # 2,004,000 for the Fishtest-SEE set. The authoritative count is in
+      # the corpus's own convert.log: "All inputs done: 2002208 chunk files
+      # written in total", which cross-checks against the layout exactly --
+      # 333 full directories x 6,000 games + 4,208 in fishtest-see-333 =
+      # 2,002,208. This leaves 1,792 of headroom; re-derive it from
+      # convert.log if the corpus is ever extended.
+      #
+      # Corrected 2026-08-25 from 1,450,000. That value was computed from a
+      # stale premise -- it assumed 1,393,183 games, and the directory
+      # comment above still described a corpus that no longer matches what
+      # is on disk. The real corpus is ~44% larger, so the pool sat roughly
+      # 552,000 chunks BELOW the total and was silently dropping ~28% of it,
+      # oldest-first, with no error: precisely the trimming failure the note
+      # at the top of this block warns about.
+      chunk_pool_size:  2004000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {
-        queue_capacity: 16
+        queue_capacity: 8
       }
     }
   }
-  stage {
-    name: "train_chunk_rescorer"
-    input: "train_shuffling_chunk_pool"
-    chunk_rescorer {
-      threads: 1
-      output {
-        queue_capacity: 16
-      }
-      dist_temp: 1.0
-      dist_offset: 0.0
-      dtz_boost: 0.0
-      new_input_format: -1
-      deblunder_threshold: 0.1
-      deblunder_width: 0.06
-    }
-  }
+  # train_chunk_rescorer removed 2026-08-25. It bundled three things:
+  #   - Syzygy relabelling: near-zero effect on this corpus (Fishtest games
+  #     are adjudicated around +4 pawns, long before any position is
+  #     tablebase-reachable -- a full-corpus rescore only relabelled ~0.02%
+  #     of games).
+  #   - V6->V7 upgrade (q_st/d_st + lookahead played-move indices): currently
+  #     unread, since losses{} below wires no value/value_error/
+  #     value_categorical loss to head_name "st" -- nothing consumes those
+  #     fields yet.
+  #   - Deblunder (deblunder_threshold: 0.1, deblunder_width: 0.06): this
+  #     part WAS doing real, active work independent of the above two --
+  #     RescorerDeblunderSetup() walks each game backwards and swaps the
+  #     training target away from raw searched Q toward the actual result
+  #     once a played move is far enough below the best move's Q. Dropping
+  #     the stage drops this too; deliberate trade for pipeline throughput.
+  # To restore: re-add the stage between train_shuffling_chunk_pool and
+  # train_chunk_unpacker with input/output wired as they were, and point
+  # train_chunk_unpacker.input back at it.
+  #
+  # stage {
+  #   name: "train_chunk_rescorer"
+  #   input: "train_shuffling_chunk_pool"
+  #   chunk_rescorer {
+  #     threads: 1
+  #     output {
+  #       queue_capacity: 4
+  #     }
+  #     syzygy_paths: "C:/Users/Contrad/Documents/syzygy/3-4-5"
+  #     dist_temp: 1.0
+  #     dist_offset: 0.0
+  #     dtz_boost: 0.0
+  #     new_input_format: -1
+  #     deblunder_threshold: 0.1
+  #     deblunder_width: 0.06
+  #   }
+  # }
   stage {
     name: "train_chunk_unpacker"
-    input: "train_chunk_rescorer"
+    input: "train_shuffling_chunk_pool"
     chunk_unpacker {
       threads: 1
-      position_sampling_rate: 0.5
+      # ---------------------------------------------------------------
+      # TACTICAL SAMPLING -- draft, not enabled.
+      #
+      # Aims at the gap where Stockfish's handcrafted evaluation sees what
+      # a policy/value net does not: sacrifices played for a concrete
+      # follow-up, and queen endgames decided by forcing sequences.
+      #
+      # PREREQUISITE: src/proto/data_loader_config_pb2.py must be
+      # regenerated first (six new fields), with a protoc matching the
+      # training environment's protobuf runtime. Python parses this file
+      # before handing it to C++, so until then text_format.Parse rejects
+      # these as unknown fields and the trainer will not start. The C++
+      # side is already written and compiles.
+      #
+      # To enable: comment out position_sampling_rate below, uncomment
+      # this.
+      #
+      position_count: 66
+      position_sampling {
+        material_sacrifice_weight: 1.0
+        endgame_focus_weight: 3.0
+        endgame_require_queens: true
+        endgame_material_max: 40.0
+        diff_focus_alpha: 1.5
+        diff_focus_beta: 0.2
+        diff_focus_tau: 2.0
+      }
+      #
+      # WHY THESE NUMBERS
+      #
+      # Tuned to put queen endgames at 20% of sampled positions, measured
+      # by replaying the real weight formula over 1,500 games rather than
+      # estimated. Result: 20.1% queen endgame, with sacrifice and endgame
+      # positions weighted EQUALLY at 1.32 against 0.20 for a quiet
+      # position -- a 6.6x boost for both.
+      #
+      # position_count 66 matches what rate 0.5 draws today: the corpus
+      # sweep measured ~130 interior positions per game.
+      #
+      # endgame_material_max 40, NOT 30, is what makes 20% reachable at
+      # all. Weights are normalised per game, so a game that never reaches
+      # a queen endgame contributes none no matter how hard the term is
+      # pushed -- the fraction of games that reach one is a hard ceiling.
+      # Measured:
+      #
+      #   material_max 30 -> only 30.3% of games qualify. Hitting 20%
+      #                      needs a ~100x within-game ratio, which makes
+      #                      those games sample almost nothing BUT endgame
+      #                      positions and destroys their middlegame
+      #                      coverage.
+      #   material_max 40 -> 54.3% of games qualify, and 20% falls out at
+      #                      a mild ratio with room to spare.
+      #
+      # 40 is also the better definition on its own terms: the starting
+      # position holds 78 points of material, so this is "queens still on,
+      # most minor pieces traded" rather than the very deep ending 30
+      # describes.
+      #
+      # The 1.0 / 3.0 split keeps the two terms comparable, and it is the
+      # one thing here that is easy to get wrong: they are NOT on the same
+      # scale. The sacrifice signal is material in pawns (a piece is ~3, a
+      # queen ~9), while the endgame term is a 0/1 indicator. Left equal,
+      # material would swamp phase entirely. At 1:3 both land on 1.32.
+      #
+      # diff_focus_beta 0.2 is a FLOOR and is load-bearing. Weights are
+      # normalised by the per-game maximum, then SampleProbabilisticSequence
+      # accepts each candidate with that probability, reshuffling until it
+      # has position_count of them. With no floor a quiet position scores
+      # exactly 0.0, is never accepted, and a game containing one sacrifice
+      # would train on that sacrifice and nothing else. It also bounds the
+      # reshuffle loop, which matters on a threads: 1 unpacker -- these
+      # values leave a worst-case acceptance of 10.2%.
+      #
+      # diff_focus_alpha 1.5 rather than a larger endgame_focus_weight is
+      # what actually buys the last few points of queen endgame share.
+      # Raising endgame_focus_weight saturates against tau and stops
+      # helping: 3.0 -> 10.0 moved the result only from 17.7% to 19.5%,
+      # while also unbalancing the sacrifice term. Scaling the whole mean
+      # lifts both signals together instead.
+      #
+      # diff_focus_tau 2.0 raises the ceiling from its 1.0 default, which
+      # would otherwise saturate everything above ~0.7 and erase the
+      # distinction between a quiet endgame, a sacrifice, and a sacrifice
+      # inside an endgame.
+      #
+            # temporal_curvature_weight is deliberately NOT set. It is
+      # implemented and available, but measurement showed it does not do
+      # what it looks like it does -- see the note below.
+      #
+      # WHY NOT SELECT ON THE EVALUATION
+      #
+      # Every eval-derived tactic detector tried here failed, for one
+      # structural reason: Stockfish's evaluation is steadiest exactly
+      # where its understanding is deepest. It does not wobble through a
+      # sound sacrifice, because it saw the compensation before playing
+      # it. Measured on this corpus:
+      #
+      #   - Compensation positions land in the top curvature decile 13.5%
+      #     of the time, against 10% by chance. Curvature does not find
+      #     sacrifices.
+      #   - Queen endgames have the LOWEST median per-ply eval movement of
+      #     any phase (0.0047 against 0.0302 overall). Volatility does not
+      #     find tactical endgames either.
+      #
+      # Both terms configured above therefore read the BOARD -- material
+      # configuration and material events from the plane bitboards -- and
+      # never the evaluation.
+      #
+      # Relatedly, material_sacrifice_weight selects on the EVENT (material
+      # was given up) and not on the OUTCOME (it turned out well). A
+      # result-based rule silently drops unsound sacrifices, because there
+      # material and evaluation agree, and a model trained only on
+      # sacrifices that worked learns that sacrificing wins. The event rule
+      # measures 44% winning / 38% losing, so both classes are present and
+      # the model has to learn what separates them.
+      #
+      # TWO THINGS TO KNOW BEFORE FLIPPING IT ON
+      #
+      # 1. Coverage. position_count mode abandons rate mode's guarantee.
+      #    PickSampledPositions partitions a game into disjoint subsets, so
+      #    over 1/rate uses every position is emitted exactly once.
+      #    SampleProbabilisticSequence draws from an infinite weighted
+      #    sequence with no coverage guarantee and no dedupe. That is the
+      #    point of weighting, but the training distribution changes, not
+      #    just the ordering.
+      #
+      # 2. This is a mid-run distribution change. The run is past step
+      #    437k on uniform sampling; switching now means loss curves before
+      #    and after are not measuring the same thing. Worth starting from
+      #    a checkpoint and comparing against a uniform control rather than
+      #    reading the existing curve straight through.
+      #
+      # Deliberately left OFF on test_chunk_unpacker below, so the eval
+      # metric keeps measuring a uniform sample and stays comparable
+      # against every checkpoint recorded before this change.
+      # ---------------------------------------------------------------
+      # position_sampling_rate: 0.5   # superseded by position_count above
       output {
         queue_capacity: 16
       }
@@ -125,7 +318,7 @@ data_loader {
     input: "train_shuffling_frame_sampler"
     tensor_generator {
       threads: 2
-      batch_size: 16
+      batch_size: 8
       output {
         queue_capacity: 4
       }
@@ -135,8 +328,11 @@ data_loader {
     name: "test_shuffling_chunk_pool"
     input: "chunk_source_splitter.test"
     shuffling_chunk_pool {
-      # Same cap as the train pool. The splitter only routes ~5% of the
-      # chunks here, so this is a ceiling the test branch never reaches.
+      # A ceiling, not a matched cap. The splitter weights route only 1%
+      # of chunks here (~20,000 of 2,002,208), so any value comfortably
+      # above that is equivalent; this one is left oversized on purpose so
+      # it never becomes the limiting factor. Unlike the train pool it does
+      # not need re-deriving when the corpus grows.
       chunk_pool_size: 3600000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
@@ -145,25 +341,31 @@ data_loader {
       }
     }
   }
-  stage {
-    name: "test_chunk_rescorer"
-    input: "test_shuffling_chunk_pool"
-    chunk_rescorer {
-      threads: 1
-      output {
-        queue_capacity: 16
-      }
-      dist_temp: 1.0
-      dist_offset: 0.0
-      dtz_boost: 0.0
-      new_input_format: -1
-      deblunder_threshold: 0.1
-      deblunder_width: 0.06
-    }
-  }
+  # test_chunk_rescorer removed 2026-08-25, same reasoning as
+  # train_chunk_rescorer above -- kept in sync so test-set positions go
+  # through the same pipeline as train, not a different label source for
+  # the eval metric.
+  #
+  # stage {
+  #   name: "test_chunk_rescorer"
+  #   input: "test_shuffling_chunk_pool"
+  #   chunk_rescorer {
+  #     threads: 1
+  #     output {
+  #       queue_capacity: 16
+  #     }
+  #     syzygy_paths: "C:/Users/Contrad/Documents/syzygy/3-4-5"
+  #     dist_temp: 1.0
+  #     dist_offset: 0.0
+  #     dtz_boost: 0.0
+  #     new_input_format: -1
+  #     deblunder_threshold: 0.1
+  #     deblunder_width: 0.06
+  #   }
+  # }
   stage {
     name: "test_chunk_unpacker"
-    input: "test_chunk_rescorer"
+    input: "test_shuffling_chunk_pool"
     chunk_unpacker {
       threads: 1
       position_sampling_rate: 0.5
@@ -203,28 +405,13 @@ data_loader {
 training {
   schedule {
     steps_per_network: 1000
-    chunks_per_network: 500
+    chunks_per_network: 5000
   }
   lr_schedule {
-    duration_steps: 0
-    # Bumped from 0.0001 on 2026-08-13: at effective batch 64 the policy head
-    # was statistically flat over ~78k steps (r=0.015 vs step), while value
-    # accuracy rose 78% -> 90% on the same lr. TF-era defaults sit in the
-    # 3e-4 -- 1e-3 range, so this is the conservative end of that. Revert if
-    # grad_norm spikes or the run diverges.
-    #
-    # Dropped to 0.00003 at step 339835 during the same-day config-switch
-    # crash loop -- that was a panic move made mid-incident, not a response
-    # to the loss actually diverging (grad_norm stayed a steady 3-9 through
-    # the whole window, never spiked). Restored to 0.0003 on 2026-08-15: the
-    # held-out test-set policy loss has been flat (2.19-2.28) from step
-    # ~180000 all the way through the current step (356336+, confirmed via
-    # both Old-tensorboard and the live tensorboard dir), i.e. the plateau
-    # long predates and outlasts this LR, so 0.00003 was never given a fair
-    # chance to fix anything -- it just added 16.5k more flat steps at a
-    # rate 10x below what was already failing to move the needle. Revert if
-    # grad_norm spikes or the run diverges.
-    lr: 0.0003
+    starting_step: 464835
+    duration_steps: [50000, 0]
+    lr: [0.0009, 0.0001]
+    transition: [COSINE, CONSTANT]
   }
   checkpoint {
     path: "C:/Users/Contrad/Documents/lc0-directml-checkpoint"
@@ -272,11 +459,11 @@ training {
     }
     value {
       head_name: "winner"
-      weight: 1.0
+      weight: 0.5
     }
     movesleft {
       head_name: "main"
-      weight: 1.0
+      weight: 0.5
     }
   }
   # 8.0, down from 16.0. Steady-state gradient norm here is ~5-6 and a
@@ -313,7 +500,7 @@ training {
   # LESS often per unit of data. At 1 it runs 4x as often and the stranding
   # outruns the headroom. Fixing the optimizer to reuse buffers would remove
   # the constraint; until then 4 is load-bearing.
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
 }
 model {
   defaults {
@@ -328,9 +515,9 @@ model {
   }
   encoder {
     num_blocks: 4
-    dff: 128
+    dff: 256
     d_model: 128
-    heads: 8
+    heads: 16
     smolgen {
       hidden_channels: 8
       hidden_size: 32
@@ -351,7 +538,7 @@ model {
       directions: "anti_diag_reverse"
       output_gate: true
       output_rms_norm: false
-      local_conv: true
+      local_conv: false
     }
     mixer_pattern: MIXER_KDA
     mixer_pattern: MIXER_KDA
@@ -362,6 +549,7 @@ model {
   policy_head {
     name: "vanilla"
     d_model: 128
+    use_bias: false
   }
   value_head {
     name: "winner"

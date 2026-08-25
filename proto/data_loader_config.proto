@@ -53,6 +53,84 @@ message PositionSamplingConfig {
   optional float diff_focus_gamma = 5 [default = 1.0];
   optional float diff_focus_tau = 6 [default = 1.0];
   optional float default_weight = 7 [default = 1.0];
+
+  // Weight on the temporal curvature of the evaluation: how far a
+  // position's root_q sits off the straight line drawn between its two
+  // neighbouring plies in the same game. Low curvature means the position
+  // continues the game's evaluation trend ("a true continuation"); high
+  // curvature marks a discontinuity -- a tactic, a blunder, or a search
+  // disagreement.
+  //
+  // Unset (the default) leaves sampling weights bit-identical to what they
+  // were before this field existed.
+  //
+  // This is deliberately independent of the diff_focus_* terms above.
+  // Those are driven by orig_q, which is NaN on any corpus converted from
+  // PGN rather than produced by self-play with an eval cache -- and on
+  // such a corpus the diff_focus path returns default_weight for every
+  // position, making it entirely inert. The curvature term needs only
+  // root_q, which is always populated, so it still works there.
+  optional float temporal_curvature_weight = 8;
+
+  // Weight on material-sacrifice EVENTS and the plies that follow them.
+  //
+  // Selects on the decision, not on the result: a position qualifies when
+  // the side to move gives up at least sacrifice_threshold material over
+  // the next sacrifice_window_plies, whatever the evaluation says about
+  // how it turned out. That distinction is the whole point of this term.
+  //
+  // Selecting on the RESULT instead -- e.g. "down material but still
+  // winning" -- looks equivalent and is not. Unsound sacrifices have
+  // material and evaluation in agreement (both say losing), so a
+  // result-based rule silently filters them out and feeds the model
+  // almost only sacrifices that worked. A model trained on that sample
+  // learns "down material implies winning" and turns sacrifice-happy,
+  // because it was never shown the counter-examples. Measured on this
+  // corpus, the event rule selects 5.1% of positions split 44% winning /
+  // 38% losing, which is the balance that forces the model to learn what
+  // actually separates a sound sacrifice from an unsound one.
+  optional float material_sacrifice_weight = 9;
+
+  // Plies to look ahead when deciding whether material was given up. Must
+  // outlast a normal capture-recapture exchange, or every routine trade
+  // registers as a sacrifice.
+  optional uint32 sacrifice_window_plies = 10 [default = 4];
+
+  // Net material, in pawns, that must be given up to count as an event.
+  optional float sacrifice_threshold = 11 [default = 2.0];
+
+  // How far the boost propagates FORWARD from the sacrifice. This is the
+  // "...but it's for this" half: the plies that follow are what justify
+  // the sacrifice, so they are trained alongside it rather than being
+  // left to ordinary sampling. Decayed by sacrifice_decay per ply.
+  optional uint32 sacrifice_lookahead_plies = 12 [default = 6];
+  optional float sacrifice_decay = 13 [default = 0.8];
+
+  // Weight on a material CONFIGURATION -- a phase filter, deliberately not
+  // a tactics detector.
+  //
+  // Queen endgames are where this is aimed: measured on this corpus they
+  // are 2.88% of all positions, so uniform sampling shows the model very
+  // few of them, and they are the phase where evaluation is decided by
+  // concrete forcing sequences rather than by structure.
+  //
+  // It is tempting to select them by evaluation volatility instead. That
+  // does not work, and the measurement is unambiguous: queen endgames have
+  // the LOWEST median per-ply eval movement of any phase in this corpus
+  // (0.0047 against 0.0302 overall). Stockfish's evaluation is at its
+  // steadiest precisely where its search has resolved the tactics, so any
+  // volatility-derived signal looks away from exactly the positions
+  // wanted. Selecting on the material configuration sidesteps that
+  // entirely -- it reads the board, not the evaluation.
+  optional float endgame_focus_weight = 14;
+
+  // Total material on the board, in pawns and counting both sides, at or
+  // below which a position qualifies. Kings excluded.
+  optional float endgame_material_max = 15 [default = 30.0];
+
+  // Require at least one queen, which is what narrows a general endgame
+  // filter to the queen endgames specifically.
+  optional bool endgame_require_queens = 16 [default = false];
 }
 
 // Configuration for shuffling chunk pool that manages chunk shuffling and

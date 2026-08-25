@@ -194,10 +194,11 @@ std::vector<float> FramesToProbabilities(std::span<const FrameType> frames,
   LCTRACE_FUNCTION_SCOPE;
   std::vector<float> probabilities;
   probabilities.reserve(frames.size());
-  absl::c_transform(frames, std::back_inserter(probabilities),
-                    [&](const FrameType& frame) {
-                      return ComputePositionSamplingWeight(frame, config);
-                    });
+  // Indexed rather than transformed over the range: the weight of a
+  // position can depend on its neighbours in the same game.
+  for (size_t i = 0; i < frames.size(); ++i) {
+    probabilities.push_back(ComputePositionSamplingWeight(frames, i, config));
+  }
   const float max_prob = *absl::c_max_element(probabilities);
   if (max_prob > 0.0f) {
     absl::c_transform(probabilities, probabilities.begin(),

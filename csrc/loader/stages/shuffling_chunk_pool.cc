@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -606,10 +607,14 @@ double ShufflingChunkPool::ComputeHanseProbability(float weight,
 
 float ShufflingChunkPool::ComputeChunkWeight(
     absl::Span<const FrameType> frames) const {
-  return absl::c_accumulate(frames, 0.0f, [this](float sum, const auto& frame) {
-    return sum +
-           ComputePositionSamplingWeight(frame, config_.position_sampling());
-  });
+  // Indexed rather than accumulated over the range: the weight of a
+  // position can depend on its neighbours in the same game.
+  const std::span<const FrameType> span(frames.data(), frames.size());
+  float sum = 0.0f;
+  for (size_t i = 0; i < span.size(); ++i) {
+    sum += ComputePositionSamplingWeight(span, i, config_.position_sampling());
+  }
+  return sum;
 }
 
 bool ShufflingChunkPool::HanseAccept(ChunkData& chunk_data) {
