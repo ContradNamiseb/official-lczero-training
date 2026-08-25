@@ -3,12 +3,14 @@ data_loader {
   stage {
     name: "file_path_provider"
     file_path_provider {
-      # Fishtest supervised set: 2,002,208 games converted with
+      # Fishtest supervised set: 2,002,171 games converted with
       # -pgn-eval-mode -wdl-scale 1.3 -visit-budget 850, then rescored
       # against 3-4-5 Syzygy. One game per chunk, 6,000 per directory
       # across 334 of them (fishtest-see-0 .. fishtest-see-333, the last
       # holding 4,208) -- matching the -chunks-per-dir 6000 used at
-      # conversion. The provider recurses, and the loader maps .gz to
+      # conversion. 37 games were removed on 2026-08-25, so seven of those
+      # directories now hold slightly fewer; see the note on chunk_pool_size
+      # below. The provider recurses, and the loader maps .gz to
       # RawFileChunkSource and .tar to TarChunkSource, so both work from
       # the same directory setting.
       #
@@ -97,12 +99,21 @@ data_loader {
       # With --data-file-count this cap only has to exceed the window, so
       # an oversized value stays correct there too.
       #
-      # 2,004,000 for the Fishtest-SEE set. The authoritative count is in
-      # the corpus's own convert.log: "All inputs done: 2002208 chunk files
-      # written in total", which cross-checks against the layout exactly --
-      # 333 full directories x 6,000 games + 4,208 in fishtest-see-333 =
-      # 2,002,208. This leaves 1,792 of headroom; re-derive it from
-      # convert.log if the corpus is ever extended.
+      # 2,004,000 for the Fishtest-SEE set. convert.log records 2,002,208
+      # chunks written, cross-checking against the layout exactly (333 full
+      # directories x 6,000 + 4,208 in fishtest-see-333). 37 of those were
+      # removed on 2026-08-25, leaving 2,002,171 and 1,829 of headroom.
+      # Re-derive from a member count, not from convert.log, if the corpus
+      # is extended again -- convert.log now overstates it by 37.
+      #
+      # The 37 were Fishtest forfeits: 1-2 ply games starting from a full
+      # 72-78 point opening position, evaluated around +/-0.4, but carrying
+      # a decisive result_q of +/-1.00 and plies_left 0-1. A balanced
+      # opening does not end decisively in one ply -- these were crashes or
+      # time losses awarded against the engine, so the label contradicted
+      # the evaluation. Under position_count each one emitted 66 copies of
+      # "balanced opening = dead loss", which is why they were worth
+      # removing rather than tolerating.
       #
       # Corrected 2026-08-25 from 1,450,000. That value was computed from a
       # stale premise -- it assumed 1,393,183 games, and the directory
