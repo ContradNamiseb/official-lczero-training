@@ -146,25 +146,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-timeout",
         type=float,
-        default=600.0,
+        default=60.0,
         help=(
             "Seconds before a stuck eval worker is killed and the eval "
             "skipped. Every second of it is a second training is paused, so "
-            "this is a ceiling on the damage one bad eval can do -- ~40x the "
-            "measured 15 s of CPU work at 20 batches, which leaves room for a "
-            "contended machine and the occasional import-phase stall that "
-            "parked every 5k-step eval here for a full week."
+            "this is a ceiling on the damage one bad eval can do."
         ),
     )
     parser.add_argument(
         "--eval-retries",
         type=int,
-        default=1,
+        default=0,
         help=(
             "Extra attempts after a failed eval, before giving up on that "
-            "step. Cheap insurance against a transient stall, not a fix for "
-            "a persistent one -- each retry costs up to --eval-timeout "
-            "again. 0 disables retrying."
+            "step. 0 disables retrying so a stall never delays training."
+        ),
+    )
+    parser.add_argument(
+        "--eval-on-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run an evaluation on the test split when training starts or restarts, "
+            "before the training step loop begins. Enabled by default."
         ),
     )
     parser.add_argument(
@@ -212,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         eval_device=args.eval_device,
         eval_timeout=args.eval_timeout,
         eval_retries=args.eval_retries,
+        eval_on_start=args.eval_on_start,
         data_file_count=args.data_file_count,
         data_phase_step_interval=args.data_phase_step_interval,
         data_phase_shuffle=args.data_phase_shuffle,

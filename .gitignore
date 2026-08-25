@@ -147,3 +147,9 @@ GEMINI.md
 # IDE
 .vscode/
 .idea/
+# Graphify tool output: ~64 MB of generated analysis, caches and rendered
+# HTML. Regenerated on demand, so it does not belong in history.
+graphify-out/
+
+# Agent tooling config, local to a working copy.
+.agents/

@@ -5,6 +5,8 @@ reference, gradients where practical, and DirectML execution with finite
 output and gradients.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -342,6 +344,43 @@ def test_local_conv_keeps_the_residual_skip():
         torch_conv.conv.bias.zero_()
     x = torch.randn(2, 64, emb)
     _assert_close(torch_conv(x).detach().numpy(), x.numpy())
+
+
+def test_local_conv_initializer_matches_flax_lecun_normal():
+    """flax's ``nnx.Conv`` defaults to a lecun_normal kernel (truncated
+    normal with std sqrt(1/fan_in)) and a zero bias; PyTorch's
+    ``nn.Conv2d`` defaults to Kaiming-uniform with a uniform bias, which
+    is a different distribution. A from-scratch torch model must start
+    from the same distribution as its JAX counterpart, like every other
+    ported layer already does -- this pins the conv to flax's init so a
+    future ``nn.Conv2d`` default change (or a forgotten
+    ``init_lecun_normal_conv_`` call) cannot silently regress.
+    """
+    emb = 16
+    torch_conv = KdaLocalConv(emb)
+    kernel = torch_conv.conv.weight.detach()
+    # Depthwise 3x3: fan_in = in // groups * kh * kw = 1 * 3 * 3 = 9.
+    fan_in = (
+        kernel.shape[1] * kernel.shape[2] * kernel.shape[3]
+    )
+    assert fan_in == 9
+    target_std = math.sqrt(1.0 / fan_in)
+    # Truncated normal at [-2, 2] has ~0.8796 of the nominal std after
+    # truncation; the init rescales so the *post-truncation* std hits the
+    # target. Assert the realized std is close to the target, not to
+    # PyTorch's Kaiming-uniform default (which would be much larger).
+    realized = kernel.float().std().item()
+    assert abs(realized - target_std) < 0.02, (
+        f"conv kernel std {realized:.4f} should match flax's lecun_normal "
+        f"target {target_std:.4f} (fan_in={fan_in}); a value near "
+        f"{math.sqrt(2.0 / (emb * 9)):.4f} would mean PyTorch's "
+        "Kaiming-uniform default is being used instead"
+    )
+    # Bias must be zero, not PyTorch's uniform init.
+    assert torch_conv.conv.bias is not None
+    assert torch.all(torch_conv.conv.bias == 0.0), (
+        "conv bias must be zero (flax default), not PyTorch's uniform init"
+    )
 
 
 # --------------------------------------------------------------------------

@@ -406,6 +406,30 @@ def init_lecun_normal_(linear: nn.Linear, *, bias_zero: bool = True) -> None:
         nn.init.zeros_(linear.bias)
 
 
+def init_lecun_normal_conv_(conv: nn.Conv2d, *, bias_zero: bool = True) -> None:
+    """flax's default ``nnx.Conv`` kernel init (lecun_normal) plus zero bias.
+
+    flax initializes conv kernels with ``variance_scaling(1.0, "fan_in",
+    "truncated_normal")`` and biases at zero; PyTorch's ``nn.Conv2d``
+    defaults (Kaiming-uniform kernel, uniform bias) differ, so a torch
+    model built from scratch started from a different distribution than
+    its JAX counterpart. Every other ported layer matched flax's inits
+    already -- this was the one that slipped through.
+
+    Fan-in for a (possibly grouped) conv kernel of shape
+    ``(out, in // groups, kh, kw)`` is ``in // groups * kh * kw`` --
+    flax's receptive-field size, not ``in_channels``.
+    """
+    kernel = conv.weight
+    receptive = kernel.shape[1] * kernel.shape[2] * kernel.shape[3]
+    stddev = math.sqrt(1.0 / receptive) / _TRUNCATED_NORMAL_STDDEV
+    nn.init.trunc_normal_(
+        kernel, mean=0.0, std=stddev, a=-2.0 * stddev, b=2.0 * stddev
+    )
+    if bias_zero and conv.bias is not None:
+        nn.init.zeros_(conv.bias)
+
+
 # --------------------------------------------------------------------------
 # Feed-forward
 # --------------------------------------------------------------------------

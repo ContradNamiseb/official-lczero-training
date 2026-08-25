@@ -365,7 +365,7 @@ model {
       directions: "anti_diag_reverse"
       output_gate: true
       output_rms_norm: false
-      local_conv: true
+      local_conv: false
     }
     mixer_pattern: MIXER_KDA
     mixer_pattern: MIXER_KDA

@@ -285,6 +285,11 @@ class KdaLocalConv(nn.Module):
             padding=1,
             groups=emb_size,  # depthwise
         )
+        # flax's nnx.Conv defaults (lecun_normal kernel, zero bias), not
+        # PyTorch's (Kaiming-uniform kernel, uniform bias): a from-scratch
+        # torch model must start from the same distribution as its JAX
+        # counterpart, like every other ported layer already does.
+        layers.init_lecun_normal_conv_(self.conv)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, 64, emb_size). Squares are token-major (rank * 8 +

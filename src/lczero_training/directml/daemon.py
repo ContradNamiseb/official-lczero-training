@@ -48,8 +48,9 @@ class DirectMlTrainingDaemon:
         eval_every: int = 0,
         eval_batches: int = 20,
         eval_device: Optional[str] = None,
-        eval_timeout: float = 600.0,
-        eval_retries: int = 1,
+        eval_timeout: float = 60.0,
+        eval_retries: int = 0,
+        eval_on_start: bool = True,
         data_file_count: Optional[int] = None,
         data_phase_step_interval: Optional[int] = None,
         data_phase_shuffle: bool = False,
@@ -72,6 +73,7 @@ class DirectMlTrainingDaemon:
         self._eval_device = eval_device
         self._eval_timeout = eval_timeout
         self._eval_retries = eval_retries
+        self._eval_on_start = eval_on_start
         self._data_file_count = data_file_count
         self._data_phase_step_interval = data_phase_step_interval
         self._data_phase_shuffle = data_phase_shuffle
@@ -342,7 +344,7 @@ class DirectMlTrainingDaemon:
             loader=loader,
             config_filepath=self._config_filepath,
             batch_count=self._eval_batches,
-            device_spec=self._eval_device or self._device_spec,
+            device_spec=self._eval_device or "cpu",
             kda_chunk_size=self._kda_chunk_size,
             timeout=self._eval_timeout,
             retries=self._eval_retries,
@@ -562,6 +564,19 @@ class DirectMlTrainingDaemon:
         eval_hook = self._make_eval_hook(
             config, model, loader, has_split, device_name
         )
+
+        if eval_hook is not None and self._eval_on_start:
+            logger.info(
+                "Running initial evaluation at step %d on clean restart before training",
+                start_step,
+            )
+            try:
+                eval_hook(start_step)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Initial evaluation at step %d failed; training continues",
+                    start_step,
+                )
 
         progress: dict[str, int] = {"step": start_step}
         failed_message: Optional[str] = None

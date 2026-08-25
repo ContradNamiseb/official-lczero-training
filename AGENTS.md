@@ -1,5 +1,26 @@
 # AGENTS.md
 
+## Memory bank first
+
+Before investigating anything whose answer was *decided* or *measured* rather
+than stated in the code -- config values, tuning constants, build flags, known
+hazards, "why is it set this way" -- query the `agent-memory-bank` MCP server
+first.
+
+1. `memory_search` with **short keyword queries**: `wdl_spread`, not
+   `what wdl spread should I use for conversion`. Terms are ANDed, so every
+   extra word narrows the result.
+2. If it returns results, use them -- but verify anything they name still
+   exists in the code before acting. Notes reflect what was true when written.
+3. If it returns nothing, say so, then investigate normally.
+4. When you establish something durable that the code does not state -- why a
+   value is what it is, what a default silently does, what an earlier attempt
+   got wrong -- record it with `memory_note_add` before you finish. Pass
+   `dry_run=true` first if you are unsure the evidence will be accepted.
+
+`memory_stats` confirms the index is populated. An empty result from a
+populated store is a real "not recorded", not a broken connection.
+
 This repository contains training script for the Leela Chess Zero project.
 They are being rewritten.
 

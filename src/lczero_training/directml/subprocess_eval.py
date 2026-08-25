@@ -84,32 +84,15 @@ WORKER_LOG_FILE = "worker.log"
 # The trainer is paused for every second of this, so it is a ceiling on the
 # damage one stuck eval can do rather than a generous allowance. Measured: 50
 # batches on the CPU take 15 s end to end, imports included.
-DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_TIMEOUT_SECONDS = 60.0
 
-# One retry beyond the first attempt. Cheap insurance, not a fix: if the real
-# trigger is a transient condition (a momentary I/O or driver stall), this
-# rides through it for the cost of one more `timeout` on the rare step where
-# it happens; if the trigger is a persistent per-process condition, this
-# retry fails the same way and costs one extra `timeout` for nothing. Either
-# way the trainer is never blocked longer than (1 + DEFAULT_RETRIES) *
-# timeout on any one eval, and it was never blocking training itself either
-# way -- a skipped eval just means one fewer point on the chart.
-DEFAULT_RETRIES = 1
+# Retries disabled by default: if a worker hangs or crashes, training immediately
+# continues without blocking for another timeout.
+DEFAULT_RETRIES = 0
 
 # Below this much free physical memory the subprocess can no longer start its
-# python interpreter next to a live trainer. Every hung eval in the 225k-300k
-# step window of one real run was logged against ``available 2.11 GB of
-# 11.65``, while the subprocess never reached its first log line -- the
-# interpreter was parked at startup (cpu ~0), not slowly working. A second
-# ``import torch`` of its own needs commit headroom that is simply not there
-# once the trainer has booked its 5+ GB. There is no good second chance
-# through that wall; a spawn would just timeout-and-kill, which is what
-# happened twenty-two times in a row before this guard existed. Skipping
-# up-front with a clear log beats a 300 s park followed by a kill, and the
-# eval retry lands at the next ``--eval-every`` step by which point the
-# machine may have recovered (e.g. after a supervisor restart freed the
-# trainer's committed memory).
-MIN_AVAILABLE_GB = 2.5
+# python interpreter next to a live trainer.
+MIN_AVAILABLE_GB = 1.0
 
 
 def work_directory(config_filepath: str) -> pathlib.Path:
@@ -248,8 +231,8 @@ def make_eval_hook(
         "--log-file",
         str(directory / WORKER_LOG_FILE),
     ]
-    if device_spec:
-        command += ["--device", device_spec]
+    eval_device = device_spec or "cpu"
+    command += ["--device", eval_device]
     if kda_chunk_size:
         command += [f"--kda-chunk-size={kda_chunk_size}"]
 

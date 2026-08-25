@@ -1,0 +1,426 @@
+# KDA 1024x15, spliced onto the bt4v18 production config.
+#
+# This is the JAX/CUDA trainer (lc0-train / lc0-tui), NOT the DirectML port
+# in this repo -- that path is a Windows/iGPU workaround and none of its
+# memory tuning (small batches, F32-only, chunk_size 8) belongs here.
+#
+# Base: the bt4v18 production config as pasted (data pipeline, all four
+# policy/three value/two movesleft heads, SWA, losses) is kept verbatim --
+# none of it is KDA-specific. The only architectural change is
+# model.encoder.kda + mixer_pattern, spliced in the same way every other
+# KDA config in this repo does it (see docs/kda_256x10_a100.textproto,
+# tf/configs/kda-t1.textproto): 3 KDA blocks then 1 MHA block, tiled.
+#
+# Everything marked CHANGEME or "verify before running" is a judgment call
+# made without you in the loop -- read those before launching, the rest is
+# your own config unchanged.
+
+log_filename: "/mnt/jax-lc0/logs/bt4v18-kda.log"
+
+data_loader {
+  stage {
+    name: "file_paths"
+    file_path_provider {
+      # Directory with training data files.
+      directory: "/mnt/jax-lc0/training_data/bt4v10/"
+    }
+  }
+  stage {
+    name: "chunk_sources"
+    input: "file_paths"
+    chunk_source_loader {
+      threads: 8          # Threads for loading chunks
+    }
+  }
+  stage {
+    name: "splitter"
+    input: "chunk_sources"
+    chunk_source_splitter {
+      weight: 95
+      output {
+        name: "train"
+        queue_capacity: 16
+      }
+
+      weight: 5
+      output {
+        name: "test"
+        queue_capacity: 768
+        overflow_behavior: KEEP_NEWEST
+      }
+    }
+  }
+  stage {
+    name: "chunk_shuffler"
+    input: "splitter.train"
+    input: "chunk_unpacker.cache"
+    shuffling_chunk_pool {
+      chunk_pool_size: 1000000     # Shuffle buffer size (chunks in memory)
+      source_ingestion_threads: 2  # Threads for ongoing indexing
+      chunk_loading_threads: 24    # Threads for loading chunk data
+      hanse_sampling_threshold: 300
+      hanse_sampling_gamma: 1.0
+      position_cache_size: 10000000
+      caching_threads: 3
+      cachehit_output: { name: "cache" }
+      position_sampling {
+	  diff_focus_q_weight: 6.0
+	  diff_focus_pol_scale: 3.5
+	  diff_focus_alpha: 3.0
+	  diff_focus_beta: 0.025
+	  diff_focus_gamma: 1.0
+	  diff_focus_tau: 1.0
+      }
+    }
+  }
+  stage {
+    name: "rescorer"
+    input: "chunk_shuffler"
+    chunk_rescorer {
+      threads: 5            # Threads for chunk rescoring
+      syzygy_paths: "/mnt/data/syzygy"  # Tablebase search paths (comma-separated)
+      gaviota_paths: "/mnt/data/gaviota"
+      dist_temp: 1.0        # Policy temperature applied during rescoring
+      dist_offset: 0.0      # Policy offset applied during rescoring
+      dtz_boost: 0.0        # DTZ boost for endgame policy tuning
+      new_input_format: -1  # Keep original input format (-1 disables change)
+      deblunder_threshold: 0.10  # Threshold for policy deblundering adjustments
+      deblunder_width: 0.06      # Width controlling smoothing around threshold
+    }
+  }
+  stage {
+    name: "chunk_unpacker"
+    input: "rescorer"
+    chunk_unpacker {
+      # input: "shuffling_chunk_pool"
+      # Probability of sampling each position within a chunk.
+      # position_sampling_rate: 0.03
+      position_count: 1
+      prefetch_count: 30
+      prefetch_output { name: "cache" }
+      position_sampling {
+	  diff_focus_q_weight: 6.0
+	  diff_focus_pol_scale: 3.5
+	  diff_focus_alpha: 3.0
+	  diff_focus_beta: 0.025
+	  diff_focus_gamma: 1.0
+	  diff_focus_tau: 1.0
+      }
+    }
+  }
+  stage {
+    name: "join_cache"
+    input: "chunk_unpacker"
+    input: "chunk_shuffler.cache"
+    join_positions {}
+  }
+  stage {
+    name: "tensor_generator"
+    input: "join_cache"
+    tensor_generator {
+      threads: 1         # Threads for tensor generation
+      batch_size: 1024    # Batch size for tensors
+      output { queue_capacity: 8 } # Output queue for batched tensors
+    }
+  }
+  output: "tensor_generator"
+
+  ##############################################################
+  # Test pipeline
+  ##############################################################
+  stage {
+    name: "test_chunk_shuffler"
+    input: "splitter.test"
+    simple_chunk_extractor {
+      output { queue_capacity: 64 }
+    }
+  }
+  stage {
+    name: "test_rescorer"
+    input: "test_chunk_shuffler"
+    chunk_rescorer {
+      threads: 5            # Threads for chunk rescoring
+      syzygy_paths: "/mnt/data/syzygy"  # Tablebase search paths (comma-separated)
+      dist_temp: 1.0        # Policy temperature applied during rescoring
+      dist_offset: 0.0      # Policy offset applied during rescoring
+      dtz_boost: 0.0        # DTZ boost for endgame policy tuning
+      new_input_format: -1  # Keep original input format (-1 disables change)
+      deblunder_threshold: 0.10  # Threshold for policy deblundering adjustments
+      deblunder_width: 0.06      # Width controlling smoothing around threshold
+    }
+  }
+  stage {
+    name: "test_chunk_unpacker"
+    input: "test_rescorer"
+    chunk_unpacker {
+      # input: "shuffling_chunk_pool"
+      # Probability of sampling each position within a chunk.
+      # position_sampling_rate: 0.03
+      position_count: 1
+      threads: 1          # Threads for unpacking chunks
+    }
+  }
+  stage {
+    name: "test_tensor_generator"
+    input: "test_chunk_unpacker"
+    tensor_generator {
+      threads: 1         # Threads for tensor generation
+      batch_size: 768    # Batch size for tensors
+      output {
+        queue_capacity: 1  # Output queue for batched tensors
+        overflow_behavior: KEEP_NEWEST
+      }
+    }
+  }
+  output: "test:test_tensor_generator"
+}
+
+model {
+  defaults {
+    # Kept F32 as pasted. bt4v18's own config runs F32 -- if that machine is
+    # actually A100-class, BF16 (see docs/kda_256x10_a100.textproto) is
+    # probably free throughput left on the table, but that is your call, not
+    # an architecture decision, so it is untouched here.
+    compute_dtype: F32
+    activation: ACTIVATION_MISH
+    ffn_activation: ACTIVATION_MISH
+  }
+  embedding { dense_size: 512 embedding_size: 1024 dff: 1536 }
+  encoder {
+    num_blocks: 15
+    dff: 1536
+    d_model: 1024
+    # Unchanged from the pasted config. Also happens to satisfy the KDA
+    # constraint below (heads must be a multiple of len(directions) = 8):
+    # 32 / 8 = 4 heads per direction.
+    heads: 32
+    smolgen {
+      hidden_channels: 32
+      hidden_size: 256
+      gen_size: 256
+      activation: ACTIVATION_SWISH
+    }
+
+    kda {
+      # key_dim is CAPPED AT 32 by the SYCL inference kernel, which keeps a
+      # per-work-item state array of this width. A net trained above 32 will
+      # not run on that backend. Do not raise it -- true at every scale,
+      # not just 128x4/256x10.
+      key_dim: 32
+      value_dim: 32
+      # Bottleneck rank of the low-rank decay/beta pairs. d_model / 4, same
+      # ratio as the 128x4 (32) and 256x10 (64) configs.
+      gate_rank: 256
+      directions: "rank_forward"
+      directions: "rank_reverse"
+      directions: "file_forward"
+      directions: "file_reverse"
+      directions: "diag_forward"
+      directions: "diag_reverse"
+      directions: "anti_diag_forward"
+      directions: "anti_diag_reverse"
+      output_gate: true
+      output_rms_norm: false
+      local_conv: true
+      # A100-scale value from docs/kda_256x10_a100.textproto, not the
+      # DirectML path's memory-constrained 8. Worth sweeping 32/64/128 once
+      # a first run is stable -- chunk size only trades sequential steps for
+      # a bigger per-chunk score matrix, the math is identical at any size.
+      chunk_size: 64
+    }
+
+    # Tiled index % 4 over 15 blocks -> K K K M K K K M K K K M K K K:
+    # 11 KDA blocks, 4 MHA blocks. Same 3:1 ratio as every other KDA config
+    # in this repo; only the list below is needed, the model tiles it.
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_KDA
+    mixer_pattern: MIXER_MHA
+  }
+  shared_policy_embedding_size: 1024
+
+  policy_head {name: "vanilla" d_model: 1024}
+  policy_head {name: "optimistic_st" d_model: 1024}
+  policy_head {name: "soft" d_model: 256}
+  policy_head {
+    name: "opponent"
+    d_model: 256
+  }
+  value_head {name: "winner" num_channels: 128}
+  value_head {
+    name: "q"
+    num_channels: 128
+    has_error_output: true
+    num_categorical_buckets: 32
+  }
+  value_head {
+    name: "st"
+    num_channels: 128
+    has_error_output: true
+    num_categorical_buckets: 32
+  }
+  movesleft_head {name: "main" num_channels: 32}
+  movesleft_head {name: "progress" num_channels: 32}
+}
+
+training {
+  schedule {
+   steps_per_network: 500
+   chunks_per_network: 30000
+  }
+  # Replaced the pasted lr_schedule. That one was a 5,000-step linear nudge
+  # starting at step 8,513,000 -- a fine-tune stub for resuming bt4v18's own
+  # checkpoint mid-run, which this is not: KDA is a different mixer, that
+  # checkpoint does not load into this model, and this run starts at step 0.
+  # Using the same from-scratch warmup + cosine shape as
+  # docs/kda_256x10_a100.textproto instead. CHANGEME: retune duration_steps
+  # once you know how many steps you actually plan to run this for -- the
+  # cosine floor lands wherever duration_steps says regardless of how far
+  # training actually gets.
+  #   0 -> 2,000        linear 0 -> 1e-3   (warmup)
+  #   2,000 -> 250,000  cosine 1e-3 -> 1e-5
+  #   250,000+          constant 1e-5
+  lr_schedule {
+    starting_step: 0
+    duration_steps: [2000, 248000, 0]
+    lr: [0.0, 0.001, 0.00001]
+    transition: [LINEAR, COSINE, CONSTANT]
+  }
+  checkpoint {
+    # Renamed from bt4v18 to bt4v18-kda -- KDA is a different architecture
+    # from the plain-MHA bt4v18 checkpoints already living at
+    # /mnt/jax-lc0/checkpoints/bt4v18, and pointing this run at that path
+    # would either refuse to load (config digest mismatch) or, worse,
+    # silently share a directory with an unrelated production run's
+    # checkpoints. CHANGEME if you want a different path.
+    path: "/mnt/jax-lc0/checkpoints/bt4v18-kda"
+    max_to_keep: 100
+  }
+  optimizer {
+    nadamw { beta_1: 0.9 beta_2: 0.999 epsilon: 1e-7 weight_decay: 1e-4
+	  decay_selector {
+           rule { match: "**/bias" include: false }
+           rule { match: "**/ln*/**" include: false }
+           rule { match: "**/embedding/embedding/**" include: false }
+           # rule { match: "**/policy_heads/**" include: true }
+           # rule { match: "**/value_heads/**" include: true }
+           # rule { match: "**/movesleft_heads/**" include: true }
+           otherwise_include: true
+        }
+	}
+    freeze_selector {
+     # Everything else is free.
+     otherwise_include: false
+    }
+  }
+  # Kept at the pasted 3.0 unchanged -- but that number was tuned against
+  # bt4v18's plain-MHA gradient statistics, and KDA's decay/gate/beta terms
+  # are a genuinely different mechanism with no track record here yet.
+  # Watch grad_norm on the first few thousand steps and be ready to raise
+  # or lower it; do not assume 3.0 is still the right ceiling.
+  max_grad_norm: 3.0
+  losses {
+    policy {head_name: "vanilla" weight: 1.0 illegal_moves: MASK type: KL}
+    policy {
+      head_name: "optimistic_st"
+      weight: 1.0
+      illegal_moves: MASK
+      type: KL
+      optimistic {
+        value_head_name: "st"
+        value_type: ST
+        strength: 2.0
+        eps: 1e-5
+        alpha: 5
+      }
+    }
+    policy {
+      head_name: "soft"
+      weight: 8.0
+      illegal_moves: MASK
+      type: KL
+      temperature: 4.0
+    }
+    value {head_name: "winner" weight: 1.0}
+    value {head_name: "q" weight: 1.0 value_type: BEST}
+    value_error {head_name: "q" weight: 1.0 value_type: BEST}
+    value_categorical {head_name: "q" weight: 0.1 value_type: BEST}
+    value {head_name: "st" weight: 1.0 value_type: ST}
+    value_error {head_name: "st" weight: 1.0 value_type: ST}
+    value_categorical {head_name: "st" weight: 0.1 value_type: ST}
+    movesleft {
+      head_name: "main"
+      value_type: RESULT
+      component: MOVES_LEFT
+      weight: 1.0
+      scale: 0.05
+      huber_delta: 10.0
+    }
+    movesleft {
+      head_name: "progress"
+      value_type: RESULT
+      component: PLIES_UNTIL_PROGRESS
+      weight: 0.5
+      scale: 0.1
+      huber_delta: 5.0
+    }
+    regularization {
+      weight: 0 # Here for the Tensorboard logging
+      selector {
+         rule { match: "**/bias" include: false }
+         rule { match: "**/ln*/**" include: false }
+         rule { match: "**/embedding/embedding/**" include: false }
+         # rule { match: "**/policy_heads/**" include: true }
+         # rule { match: "**/value_heads/**" include: true }
+         # rule { match: "**/movesleft_heads/**" include: true }
+         otherwise_include: true
+      }
+   }
+  }
+  swa {
+    period_steps: 100
+    num_averages: 100
+  }
+}
+
+metrics {
+  tensorboard_path: "/mnt/jax-lc0/tensorboard/bt4v18-kda"
+  metric {
+    name: "train"
+    training_batch {}
+  }
+  metric {
+    name: "test"
+    dataloader_output: "test"
+    period: 100
+    after_epoch: true
+  }
+  metric {
+    name: "test-swa"
+    use_swa_model: true
+    dataloader_output: "test"
+    period: 100
+    after_epoch: true
+  }
+  metric {
+    name: "rmsnorm"
+    weights { rms: true }
+  }
+  metric {
+    name: "rmsnorm-swa"
+    use_swa_model: true
+    weights { rms: true }
+  }
+}
+
+export {
+  destination_filename: "/mnt/jax-lc0/exported-networks/bt4v18-kda/lc0-{datetime}-{step:08d}.pb.gz"
+  export_swa_model: true
+  # Dropped from the pasted upload_training_run: 2. That id is presumably
+  # bt4v18's own established run on the upload server; a first-time,
+  # untested architecture uploading into it would mix an unproven net into
+  # a real run's rating pool. CHANGEME: set this once you have a training
+  # run id for the KDA variant specifically, or leave it unset to export
+  # locally only.
+  # upload_training_run: CHANGEME
+}

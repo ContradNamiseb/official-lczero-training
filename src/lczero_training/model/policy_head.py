@@ -39,12 +39,14 @@ class PolicyHead(nnx.Module):
         self.q = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            use_bias=config.use_bias,
             rngs=rngs,
         )
 
         self.k = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            use_bias=config.use_bias,
             rngs=rngs,
         )
 

@@ -46,8 +46,12 @@ class PolicyHead(nn.Module):
             self.tokens = nn.Linear(in_features, embedding_size)
             layers.init_lecun_normal_(self.tokens)
 
-        self.q = nn.Linear(embedding_size, config.d_model)
-        self.k = nn.Linear(embedding_size, config.d_model)
+        self.q = nn.Linear(
+            embedding_size, config.d_model, bias=config.use_bias
+        )
+        self.k = nn.Linear(
+            embedding_size, config.d_model, bias=config.use_bias
+        )
         layers.init_lecun_normal_(self.q)
         layers.init_lecun_normal_(self.k)
 

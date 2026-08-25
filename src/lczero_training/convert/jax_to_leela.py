@@ -83,6 +83,16 @@ class JaxToLeela(LeelaPytreeWeightsVisitor):
 
         assert len(leela.params) // 2 == weights.size
 
+    def zero_bias(
+        self,
+        kernel_param: nnx.Param,
+        biases: net_pb2.Weights.Layer,
+    ) -> None:
+        out_features = np.asarray(kernel_param.value).shape[-1]
+        self._write_quantized(
+            np.zeros(out_features, dtype=np.float32), biases
+        )
+
     def kda_local_conv(
         self,
         nnx_dict: nnx.State,

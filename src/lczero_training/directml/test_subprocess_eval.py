@@ -308,7 +308,9 @@ def test_a_hung_worker_is_killed_and_the_eval_skipped(
 def test_a_hung_worker_is_retried_before_giving_up(
     tmp_path, monkeypatch, caplog
 ):
-    """The default: one retry, so two attempts before the eval is skipped."""
+    """One retry (retries=1) means two attempts before the eval is skipped.
+    The default is now retries=0 (one attempt, no retry) so this test opts
+    into retries explicitly."""
     import logging
 
     config = make_tiny_config()
@@ -331,14 +333,14 @@ def test_a_hung_worker_is_retried_before_giving_up(
         config_filepath=str(tmp_path / "config.textproto"),
         batch_count=1,
         timeout=1.0,
-        # retries left at the default (1).
+        retries=1,
         on_scalars=lambda step, scalars: pytest.fail("should not report"),
     )
 
     with caplog.at_level(logging.ERROR):
         hook(99)
 
-    assert len(spawned) == 2, "one retry means two spawn attempts"
+    assert len(spawned) == 2, "retries=1 means two spawn attempts"
     assert any(
         "did not succeed in 2 attempt" in record.message
         for record in caplog.records
@@ -396,6 +398,7 @@ def test_a_worker_that_succeeds_on_retry_still_reports(tmp_path, monkeypatch):
         config_filepath=str(tmp_path / "config.textproto"),
         batch_count=1,
         timeout=1.0,
+        retries=1,
         on_scalars=lambda step, scalars: reported.append((step, scalars)),
     )
 
@@ -460,9 +463,9 @@ def test_low_memory_skips_eval_without_attempting_to_spawn(
     )
     from lczero_training.directml import host_memory
 
-    monkeypatch.setattr(host_memory, "available_gb", lambda: 1.2)
+    monkeypatch.setattr(host_memory, "available_gb", lambda: 0.5)
     monkeypatch.setattr(
-        host_memory, "snapshot", lambda: "available 1.20 GB of 11.65"
+        host_memory, "snapshot", lambda: "available 0.50 GB of 11.65"
     )
 
     hook = subprocess_eval.make_eval_hook(
@@ -480,7 +483,7 @@ def test_low_memory_skips_eval_without_attempting_to_spawn(
     assert spawned == [], "low memory must skip the spawn, not pay the timeout"
     assert any(
         "Skipping evaluation at step 7001" in record.message
-        and "1.20 GB" in record.message
+        and "0.50 GB" in record.message
         for record in caplog.records
     ), "the skip reason must say which step and how much memory"
 

@@ -90,6 +90,7 @@ message PolicyHeadConfig {
   optional string name = 1;
   optional uint32 embedding_size = 2;
   optional uint32 d_model = 3;
+  optional bool use_bias = 4 [default = true];
 }
 
 message ValueHeadConfig {

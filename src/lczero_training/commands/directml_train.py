@@ -349,11 +349,16 @@ def main(argv: list[str] | None = None) -> int:
             loader=loader,
             config_filepath=args.config,
             batch_count=args.eval_batches,
-            device_spec=args.eval_device or args.device,
+            device_spec=args.eval_device or "cpu",
             kda_chunk_size=args.kda_chunk_size,
             timeout=args.eval_timeout,
             on_scalars=log_eval,
         )
+        logging.info("Running initial evaluation at step %d before training starts", restored.step)
+        try:
+            eval_hook(restored.step)
+        except Exception:
+            logging.exception("Initial evaluation at step %d failed; training continues", restored.step)
     try:
         for segment_steps in training_segments(
             restored.step, target_step, checkpoint_interval
