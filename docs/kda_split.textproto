@@ -27,7 +27,7 @@ data_loader {
       # Previous corpus (345 tars, 89 GB) if you want to switch back:
       # directory: "C:/Users/Contrad/Documents/training-data/k2hybrid-bt4tf13g-v7op1"
       # directory: "C:/Users/Contrad/Documents/training-data/fishtest-archives"
-	  directory: "C:/Users/Contrad/Documents/training-data/Fishtest-SEE-tars"
+	  directory: "C:/Users/Contrad/Documents/training-data/fishtest_vltc-tars"
       output {
         queue_capacity: 16
       }
@@ -122,7 +122,20 @@ data_loader {
       # 552,000 chunks BELOW the total and was silently dropping ~28% of it,
       # oldest-first, with no error: precisely the trimming failure the note
       # at the top of this block warns about.
-      chunk_pool_size:  2004000
+      #
+      # 4,300,000 for the VLTC set (2026-08-26). The corpus is 2,539,727
+      # chunks in 424 tars, so the binding constraint is NOT the chunk
+      # count but the tar-count x 10,000 floor noted above: 424 x 10,000 =
+      # 4,240,000. 4,300,000 clears both with headroom, and oversizing is
+      # safe per the --data-file-count note.
+      #
+      # 2,539,727 is the converter's own "All inputs done" total, not a
+      # manifest figure. Fishtest's per-run JSON overstates game counts
+      # badly -- the 2018-2019 long-TC runs claim thousands and hold single
+      # digits -- so the corpus came out 152,955 under what the download
+      # manifests projected. Re-derive from the converter output or a
+      # member count, never from Fishtest metadata.
+      chunk_pool_size:  4300000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {
@@ -170,7 +183,7 @@ data_loader {
     name: "train_chunk_unpacker"
     input: "train_shuffling_chunk_pool"
     chunk_unpacker {
-      threads: 1
+      threads: 2
       # ---------------------------------------------------------------
       # TACTICAL SAMPLING -- draft, not enabled.
       #
@@ -190,13 +203,16 @@ data_loader {
       #
       position_count: 66
       position_sampling {
-        material_sacrifice_weight: 1.0
+        material_sacrifice_weight: 1.8
+		sacrifice_threshold: 2.5
+		sacrifice_lookahead_plies: 20
+		sacrifice_decay: 0.88
         endgame_focus_weight: 3.0
         endgame_require_queens: true
         endgame_material_max: 40.0
         diff_focus_alpha: 1.5
-        diff_focus_beta: 0.2
-        diff_focus_tau: 2.0
+        diff_focus_beta: 0.12
+        diff_focus_tau: 2.5
       }
       #
       # WHY THESE NUMBERS
@@ -309,7 +325,7 @@ data_loader {
       # ---------------------------------------------------------------
       # position_sampling_rate: 0.5   # superseded by position_count above
       output {
-        queue_capacity: 16
+        queue_capacity: 8
       }
     }
   }
@@ -344,7 +360,10 @@ data_loader {
       # above that is equivalent; this one is left oversized on purpose so
       # it never becomes the limiting factor. Unlike the train pool it does
       # not need re-deriving when the corpus grows.
-      chunk_pool_size: 3600000
+      # Raised 3,600,000 -> 4,300,000 with the train pool on 2026-08-26:
+      # both pools index the same 424-tar corpus, so both are subject to the
+      # tar-count x 10,000 floor (4,240,000). 3,600,000 sat below it.
+      chunk_pool_size: 4300000
       source_ingestion_threads: 1
       chunk_loading_threads: 4
       output {
@@ -419,8 +438,8 @@ training {
     chunks_per_network: 5000
   }
   lr_schedule {
-    starting_step: 464835
-    duration_steps: [50000, 0]
+    starting_step: 465835
+    duration_steps: [200000, 0]
     lr: [0.0009, 0.0001]
     transition: [COSINE, CONSTANT]
   }
@@ -470,11 +489,11 @@ training {
     }
     value {
       head_name: "winner"
-      weight: 0.5
+      weight: 1.0
     }
     movesleft {
       head_name: "main"
-      weight: 0.5
+      weight: 1.0
     }
   }
   # 8.0, down from 16.0. Steady-state gradient norm here is ~5-6 and a
