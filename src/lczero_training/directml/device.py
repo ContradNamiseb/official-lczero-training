@@ -1,8 +1,16 @@
-"""DirectML device discovery and smoke tests.
+"""Torch device discovery and smoke tests.
 
-Importing this module requires the optional `directml` extra (torch and
-torch-directml). Nothing in the base package imports it, so a Linux
-environment without PyTorch can still import `lczero_training`.
+Importing this module requires torch. `torch_directml` is optional and only
+needed to actually address a DirectML adapter: on Linux/CUDA the extra does
+not exist (torch-directml publishes Windows wheels only), so the import is
+deferred rather than done at module scope. Nothing in the base package
+imports this module, so a Linux environment without PyTorch at all can still
+import `lczero_training`.
+
+The module keeps its `directml` package path for history's sake. It is not
+DirectML-specific any more -- `resolve_device` has always passed an
+unrecognised spec straight to `torch.device`, so `--device cuda` works here
+the same way `--device cpu` always did.
 """
 
 from __future__ import annotations
@@ -18,8 +26,23 @@ _IMPORT_HINT = (
 
 try:
     import torch_directml
-except ImportError as error:  # pragma: no cover - environment dependent
-    raise ImportError(_IMPORT_HINT) from error
+except ImportError:  # pragma: no cover - environment dependent
+    # Not fatal. A CUDA or CPU run never touches it, and the functions that
+    # genuinely need an adapter raise through _require_directml() with the
+    # same hint the module-scope import used to raise.
+    torch_directml = None  # type: ignore[assignment]
+
+
+def _require_directml():
+    """Return the torch_directml module, or explain why it is missing."""
+    if torch_directml is None:
+        raise ImportError(_IMPORT_HINT)
+    return torch_directml
+
+
+def directml_available() -> bool:
+    """Whether DirectML adapters can be addressed in this process at all."""
+    return torch_directml is not None
 
 
 def ensure_initialized() -> None:
@@ -41,21 +64,38 @@ def ensure_initialized() -> None:
     backward run before ``import torch_directml`` is enough to poison the
     process. Any entry point that may run a CPU backward before reaching
     the DirectML path must import this module first.
+
+    On a build without torch_directml (Linux/CUDA) there is no PrivateUse1
+    backend to register, so there is nothing to guarantee and this is a
+    no-op. It stays callable unconditionally so entry points do not have to
+    branch on the device before they have parsed one.
     """
 
 
 def device_count() -> int:
     """Number of DirectML adapters visible to this process."""
+    if torch_directml is None:
+        return 0
     return int(torch_directml.device_count())
 
 
 def adapter_name(index: int = 0) -> str:
-    """Human-readable adapter name, e.g. ``Intel(R) Iris(R) Xe Graphics``."""
-    return str(torch_directml.device_name(index))
+    """Human-readable name of the accelerator, for logs.
+
+    Covers both backends because every caller wants the same thing -- a
+    string to put next to the step rate -- and neither should have to know
+    which kind of device it ended up on.
+    """
+    if torch_directml is not None:
+        return str(torch_directml.device_name(index))
+    if torch.cuda.is_available():
+        return str(torch.cuda.get_device_name(index))
+    return "cpu"
 
 
 def get_device(index: int = 0) -> torch.device:
     """Return the ``privateuseone`` device for the given adapter index."""
+    _require_directml()
     if device_count() == 0:
         raise RuntimeError("No DirectML adapter was found.")
     return torch_directml.device(index)
@@ -64,11 +104,23 @@ def get_device(index: int = 0) -> torch.device:
 def resolve_device(spec: str | None = None) -> torch.device:
     """Turn a CLI device string into a torch device.
 
-    ``None`` and ``"directml"`` select adapter 0; ``"directml:N"`` selects
-    adapter N; anything else is passed to ``torch.device`` unchanged, which
-    keeps ``--device cpu`` working for the JAX-comparison paths.
+    ``"directml"`` selects adapter 0 and ``"directml:N"`` adapter N; anything
+    else is passed to ``torch.device`` unchanged, which is what makes
+    ``--device cuda`` and ``--device cpu`` work without a branch here.
+
+    ``None`` means "whatever this machine has", resolved DirectML first and
+    then CUDA. Defaulting to DirectML unconditionally -- which this did
+    while Windows was the only target -- turns an unset ``--device`` on a
+    CUDA box into an ImportError about a Windows-only wheel, which is a
+    confusing way to learn that a flag was forgotten.
     """
-    if spec is None or spec == "directml":
+    if spec is None:
+        if torch_directml is not None and device_count() > 0:
+            return get_device(0)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    if spec == "directml":
         return get_device(0)
     if spec.startswith("directml:"):
         return get_device(int(spec.split(":", 1)[1]))

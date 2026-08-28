@@ -33,7 +33,18 @@ import ctypes
 import logging
 import os
 import time
-from ctypes import wintypes
+
+# ``ctypes.wintypes`` raises ValueError at import time on anything that is
+# not Windows, so it cannot sit at module scope: training.py imports this
+# module unconditionally, and a Linux/CUDA run would die here before it ever
+# reached a device. The PDH reader below is the only user, and it already
+# fails soft.
+try:
+    from ctypes import wintypes
+except (ImportError, ValueError):  # pragma: no cover - platform dependent
+    wintypes = None  # type: ignore[assignment]
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -53,24 +64,50 @@ WARN_INTERVAL_SECONDS = 30.0
 _last_warned = 0.0
 
 
-class _CounterValueItem(ctypes.Structure):
-    """PDH_FMT_COUNTERVALUE_ITEM_W.
+# Defined only where wintypes exists. A ctypes.Structure evaluates its
+# _fields_ at class-creation time, so this cannot be written defensively
+# inside the class -- referencing wintypes.LPWSTR with wintypes set to None
+# raises AttributeError during import, which is exactly the failure this
+# module must not have on Linux.
+#
+# Leaving the name undefined off-Windows is safe because its only use is
+# inside _Reader.read(), which is unreachable there: _open() returns False
+# when wintypes is None and read() short-circuits on that.
+if wintypes is not None:
 
-    The explicit pad matters: the value union is 8-byte aligned, so without
-    it every ``largeValue`` is read from the wrong offset and the numbers
-    look plausible while being wrong.
-    """
+    class _CounterValueItem(ctypes.Structure):
+        """PDH_FMT_COUNTERVALUE_ITEM_W.
 
-    _fields_ = [
-        ("szName", wintypes.LPWSTR),
-        ("CStatus", wintypes.DWORD),
-        ("_pad", ctypes.c_uint32),
-        ("largeValue", ctypes.c_longlong),
-    ]
+        The explicit pad matters: the value union is 8-byte aligned, so
+        without it every ``largeValue`` is read from the wrong offset and
+        the numbers look plausible while being wrong.
+        """
+
+        _fields_ = [
+            ("szName", wintypes.LPWSTR),
+            ("CStatus", wintypes.DWORD),
+            ("_pad", ctypes.c_uint32),
+            ("largeValue", ctypes.c_longlong),
+        ]
 
 
 def _shared_limit_mb() -> float | None:
-    """The WDDM shared-memory ceiling: half of system RAM, by policy."""
+    """The memory ceiling an allocation on this device comes out of.
+
+    On DirectML this is the WDDM shared-memory carve-out -- half of system
+    RAM by policy, derived rather than measured because Windows publishes no
+    counter for it. On CUDA it is real dedicated VRAM, reported by the
+    driver, so it is a measurement rather than a reference line.
+    """
+    # Defined before _cuda_active() textually, so the check is inlined here
+    # rather than reaching forward to a helper that is not bound yet at
+    # import time. (It would be by call time, but the forward reference
+    # makes the file harder to read than the duplicated condition does.)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        try:
+            return torch.cuda.mem_get_info()[1] / _MB
+        except Exception:  # noqa: BLE001
+            return None
     try:
         import psutil
 
@@ -90,6 +127,9 @@ class _Reader:
 
     def _open(self) -> bool:
         if self._broken:
+            return False
+        if wintypes is None:
+            self._broken = True
             return False
         if self._query is not None:
             return True
@@ -164,8 +204,54 @@ class _Reader:
 _reader = _Reader()
 
 
+# --------------------------------------------------------------- CUDA path
+#
+# Everything above this line reads PDH because torch_directml exposes no
+# memory query at all. CUDA does, so on that backend the same three numbers
+# come straight from the driver and the counter machinery is bypassed.
+#
+# The mapping is not quite one to one, and the difference matters when
+# reading a log from both backends:
+#
+#   adapter_committed_mb   total - free from cudaMemGetInfo. Device-wide and
+#                          across processes, which is what the PDH adapter
+#                          counter measures too.
+#   process_committed_mb   torch.cuda.memory_reserved(), i.e. what this
+#                          process's caching allocator holds. Deliberately
+#                          NOT memory_allocated(): reserved is the number
+#                          comparable to a DirectML "commitment", since
+#                          cached-but-free blocks are still held from the
+#                          driver's point of view.
+#   _shared_limit_mb       real VRAM, a hard number -- unlike the DirectML
+#                          case, where the limit is derived from WDDM policy
+#                          and is only a reference line.
+#
+# On CUDA the low-water warning is much less interesting than it is on
+# DirectML: the caching allocator reclaims, so sitting at 92% is normal
+# steady state rather than a symptom. It is left enabled because a genuine
+# approach to the cap still precedes an OOM, but do not read it as the
+# restart signal it is on the iGPU.
+
+
+def _cuda_active() -> bool:
+    """Whether to answer from CUDA rather than from PDH."""
+    return torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+
+def _cuda_mem_info() -> tuple[float, float] | None:
+    """(free_mb, total_mb) for the current CUDA device."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return free / _MB, total / _MB
+    except Exception:  # noqa: BLE001 - diagnostics must never break a step
+        return None
+
+
 def adapter_committed_mb() -> float | None:
     """Everything every process has committed on the GPU, in MB."""
+    if _cuda_active():
+        info = _cuda_mem_info()
+        return None if info is None else info[1] - info[0]
     rows = _reader.read(_ADAPTER_PATH)
     if not rows:
         return None
@@ -178,7 +264,16 @@ def process_committed_mb(pid: int | None = None) -> float | None:
     Filtered in Python rather than through a ``pid_N*`` counter path: PDH
     fails the whole collect when a wildcard matches no instance, and a
     process that has not touched the GPU yet has none.
+
+    The ``pid`` argument is meaningless on CUDA -- the allocator can only
+    report on its own process -- so it is ignored there rather than
+    pretending to honour it.
     """
+    if _cuda_active():
+        try:
+            return torch.cuda.memory_reserved() / _MB
+        except Exception:  # noqa: BLE001
+            return None
     rows = _reader.read(_PROCESS_PATH)
     if not rows:
         return None
@@ -206,8 +301,22 @@ def warn_if_low(context: str) -> None:
     """Warn while the adapter still has room to report it.
 
     Rate-limited, because the training loop calls this every step.
+
+    Silent on CUDA, and that is not an oversight. The number this compares
+    against the cap is driver-level usage, which on CUDA includes everything
+    PyTorch's caching allocator is holding -- and the allocator does not
+    return blocks to the driver unless empty_cache() is called. A healthy
+    CUDA run therefore climbs to near the cap and stays there, so the
+    warning would fire every 30 seconds forever while describing nothing.
+    The advice in the message is DirectML's, too: on that backend a restart
+    really is the only thing that returns the memory, whereas on CUDA the
+    allocator reuses it. A genuine CUDA OOM raises, loudly, at the
+    allocation site.
     """
     global _last_warned
+
+    if _cuda_active():
+        return
 
     adapter = adapter_committed_mb()
     limit = _shared_limit_mb()

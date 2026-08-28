@@ -73,6 +73,21 @@ directml = [
     "torch==2.4.1 ; sys_platform == 'win32'",
     "torch-directml==0.2.5.dev240914 ; sys_platform == 'win32'",
 ]
+# Linux CUDA PyTorch training -- the same trainer as `directml`, on a real
+# GPU. Separate from the `cuda` extra above, which is JAX: these two are
+# alternative trainers, not layers, and installing both only wastes disk.
+#
+# Not pinned to 2.4.1 like the DirectML extra. That pin exists because
+# torch-directml 0.2.5 builds against exactly that version; nothing on the
+# CUDA side shares the constraint, and newer torch has markedly better
+# compile support for the KDA chunked scan.
+#
+# The platform marker is what lets this coexist with `directml` in one lock
+# file: the two resolve on different operating systems and never collide.
+cuda-torch = [
+    "torch>=2.5 ; sys_platform == 'linux'",
+    "psutil>=5.9",
+]
 dev = [
     "pytest>=7.0.0",
     "mypy>=1.0.0",

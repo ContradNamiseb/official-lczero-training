@@ -22,6 +22,11 @@ from torch import nn
 
 from proto import net_pb2
 
+# Safe at module scope: device.py imports torch and nothing from this
+# package, so there is no cycle. Imported for directml_available(), which
+# gates the softplus override at the bottom of this file.
+from . import device as _dml_device
+
 # nnx.LayerNorm(epsilon=1e-3) throughout the JAX model (encoder.py,
 # embedding.py, Smolgen). Not PyTorch's 1e-5 default.
 LAYER_NORM_EPS = 1e-3
@@ -260,17 +265,32 @@ def safe_directml_softplus(
     )
 
 
-# Install the override globally for the DirectML backend. ``setattr`` is used
-# so static type checkers do not flag the signature mismatch with PyTorch's
-# overloaded ``softplus``.
-setattr(torch.nn.functional, "softplus", safe_directml_softplus)
-setattr(
-    torch.nn.Softplus,
-    "forward",
-    lambda self, input: safe_directml_softplus(
-        input, self.beta, self.threshold
-    ),
-)
+# Install the override globally, but ONLY where the broken kernel lives.
+#
+# The patch is mathematically equivalent to PyTorch's own softplus, so
+# leaving it installed everywhere would be correct -- it is gated because it
+# is not free. It replaces one fused CUDA kernel with a `where` plus a
+# `clamp`, an `exp` and a `log1p`, materialising several extra tensors on a
+# function called once per mish activation and once per KDA log-decay, which
+# is a great many times per step. CUDA's native softplus is already the
+# threshold-linearized form this reimplements.
+#
+# The gate is the presence of torch_directml rather than the device of any
+# particular tensor, because the patch has to be installed at import time
+# (before any module builds a Softplus) and there is no tensor to inspect
+# yet. A Windows box with torch_directml installed keeps the override on
+# every device including CPU, which is the conservative direction: the CPU
+# path there is only used for the JAX-comparison runs and the smoke tests,
+# and both want the same numerics as the DirectML path they are checking.
+if _dml_device.directml_available():
+    setattr(torch.nn.functional, "softplus", safe_directml_softplus)
+    setattr(
+        torch.nn.Softplus,
+        "forward",
+        lambda self, input: safe_directml_softplus(
+            input, self.beta, self.threshold
+        ),
+    )
 
 
 def mish(x: torch.Tensor) -> torch.Tensor:
