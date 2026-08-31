@@ -115,6 +115,41 @@ KDA_TRAVERSALS = {
             )
         )
     ),
+    # The diagonal walks need this more than the orthogonal ones do: grouping
+    # by diagonal breaks 12 times per scan against the rank walk's 7. Walking
+    # alternate diagonals in opposite directions closes every one of them.
+    "diag_serpentine": tuple(
+        rank * 8 + (rank - diag)
+        for index, diag in enumerate(range(-7, 8))
+        for rank in (range(8) if index % 2 == 0 else range(7, -1, -1))
+        if 0 <= rank - diag < 8
+    ),
+    "diag_serpentine_reverse": tuple(
+        reversed(
+            tuple(
+                rank * 8 + (rank - diag)
+                for index, diag in enumerate(range(-7, 8))
+                for rank in (range(8) if index % 2 == 0 else range(7, -1, -1))
+                if 0 <= rank - diag < 8
+            )
+        )
+    ),
+    "anti_diag_serpentine": tuple(
+        rank * 8 + (diag - rank)
+        for index, diag in enumerate(range(15))
+        for rank in (range(8) if index % 2 == 0 else range(7, -1, -1))
+        if 0 <= diag - rank < 8
+    ),
+    "anti_diag_serpentine_reverse": tuple(
+        reversed(
+            tuple(
+                rank * 8 + (diag - rank)
+                for index, diag in enumerate(range(15))
+                for rank in (range(8) if index % 2 == 0 else range(7, -1, -1))
+                if 0 <= diag - rank < 8
+            )
+        )
+    ),
 }
 
 # Applied to KdaConfig.directions when KdaConfig.serpentine is set. The
@@ -124,6 +159,10 @@ SERPENTINE_SUBSTITUTIONS = {
     "rank_reverse": "rank_serpentine_reverse",
     "file_forward": "file_serpentine",
     "file_reverse": "file_serpentine_reverse",
+    "diag_forward": "diag_serpentine",
+    "diag_reverse": "diag_serpentine_reverse",
+    "anti_diag_forward": "anti_diag_serpentine",
+    "anti_diag_reverse": "anti_diag_serpentine_reverse",
 }
 
 # Per-token log decay floor. Retaining exp(-10) of the state per token is

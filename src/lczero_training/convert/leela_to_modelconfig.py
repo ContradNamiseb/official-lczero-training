@@ -34,6 +34,16 @@ _KDA_ENUM_TO_DIRECTION = {
     net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE_REVERSE: (
         "file_serpentine_reverse"
     ),
+    net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_SERPENTINE: "diag_serpentine",
+    net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_SERPENTINE_REVERSE: (
+        "diag_serpentine_reverse"
+    ),
+    net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_SERPENTINE: (
+        "anti_diag_serpentine"
+    ),
+    net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_SERPENTINE_REVERSE: (
+        "anti_diag_serpentine_reverse"
+    ),
 }
 
 

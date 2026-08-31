@@ -23,6 +23,10 @@ _SERPENTINE_SUBSTITUTIONS = {
     "rank_reverse": "rank_serpentine_reverse",
     "file_forward": "file_serpentine",
     "file_reverse": "file_serpentine_reverse",
+    "diag_forward": "diag_serpentine",
+    "diag_reverse": "diag_serpentine_reverse",
+    "anti_diag_forward": "anti_diag_serpentine",
+    "anti_diag_reverse": "anti_diag_serpentine_reverse",
 }
 
 # Maps a KdaConfig.directions string to the engine's KdaDirection enum.
@@ -43,6 +47,16 @@ _KDA_DIRECTION_TO_ENUM = {
     "file_serpentine": net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE,
     "file_serpentine_reverse": (
         net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE_REVERSE
+    ),
+    "diag_serpentine": net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_SERPENTINE,
+    "diag_serpentine_reverse": (
+        net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_SERPENTINE_REVERSE
+    ),
+    "anti_diag_serpentine": (
+        net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_SERPENTINE
+    ),
+    "anti_diag_serpentine_reverse": (
+        net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_SERPENTINE_REVERSE
     ),
 }
 
