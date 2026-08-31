@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 _EMBEDDING_PLANE_TO_SCALE = 109
 _EMBEDDING_SCALE = 99.0
 
+# Mirrors SERPENTINE_SUBSTITUTIONS in model/kda.py. Duplicated rather than
+# imported so the converter does not pull in the model package.
+_SERPENTINE_SUBSTITUTIONS = {
+    "rank_forward": "rank_serpentine",
+    "rank_reverse": "rank_serpentine_reverse",
+    "file_forward": "file_serpentine",
+    "file_reverse": "file_serpentine_reverse",
+}
+
 # Maps a KdaConfig.directions string to the engine's KdaDirection enum.
 # Mirrors set_kda_directions() in stable-branch/tf/net.py.
 _KDA_DIRECTION_TO_ENUM = {
@@ -27,6 +36,14 @@ _KDA_DIRECTION_TO_ENUM = {
     "diag_reverse": net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_REVERSE,
     "anti_diag_forward": net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_FORWARD,
     "anti_diag_reverse": net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_REVERSE,
+    "rank_serpentine": net_pb2.NetworkFormat.KDA_DIRECTION_RANK_SERPENTINE,
+    "rank_serpentine_reverse": (
+        net_pb2.NetworkFormat.KDA_DIRECTION_RANK_SERPENTINE_REVERSE
+    ),
+    "file_serpentine": net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE,
+    "file_serpentine_reverse": (
+        net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE_REVERSE
+    ),
 }
 
 
@@ -133,6 +150,7 @@ class JaxToLeela(LeelaPytreeWeightsVisitor):
             # explicitly, matching stable-branch/tf/net.py:120.
             weights.kda.output_rms_norm = kda_config.output_rms_norm
             weights.kda.local_conv = kda_config.local_conv
+            weights.kda.qkv_silu = kda_config.qkv_silu
         else:
             weights.mixer = net_pb2.Weights.EncoderLayer.MIXER_MHA
         super().encoder_block(nnx_dict=nnx_dict, weights=weights)
@@ -220,6 +238,15 @@ def _make_format(
 
     if has_kda:
         directions = list(encoder_config.kda.directions)
+        if encoder_config.kda.serpentine:
+            # KdaMixer substitutes these internally, so the config still
+            # names the orthogonal walks. Resolve them here or the exported
+            # net would declare a scan order the weights were never trained
+            # on -- silently wrong at inference, which is exactly what a
+            # graph-based backend like OpenVINO would faithfully reproduce.
+            directions = [
+                _SERPENTINE_SUBSTITUTIONS.get(name, name) for name in directions
+            ]
         if not directions:
             raise ValueError(
                 "KdaConfig.directions must not be empty for a KDA network."

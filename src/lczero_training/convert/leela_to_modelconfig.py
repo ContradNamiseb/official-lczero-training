@@ -23,6 +23,17 @@ _KDA_ENUM_TO_DIRECTION = {
     net_pb2.NetworkFormat.KDA_DIRECTION_DIAG_REVERSE: "diag_reverse",
     net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_FORWARD: "anti_diag_forward",
     net_pb2.NetworkFormat.KDA_DIRECTION_ANTI_DIAG_REVERSE: "anti_diag_reverse",
+    # Imported as explicit direction names, leaving KdaConfig.serpentine
+    # false: the substitution is idempotent, so a config naming the
+    # serpentine walks directly builds exactly the same model.
+    net_pb2.NetworkFormat.KDA_DIRECTION_RANK_SERPENTINE: "rank_serpentine",
+    net_pb2.NetworkFormat.KDA_DIRECTION_RANK_SERPENTINE_REVERSE: (
+        "rank_serpentine_reverse"
+    ),
+    net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE: "file_serpentine",
+    net_pb2.NetworkFormat.KDA_DIRECTION_FILE_SERPENTINE_REVERSE: (
+        "file_serpentine_reverse"
+    ),
 }
 
 
@@ -125,6 +136,7 @@ def leela_to_modelconfig(
         model_config.encoder.kda.output_gate = kda.output_gate
         model_config.encoder.kda.output_rms_norm = kda.output_rms_norm
         model_config.encoder.kda.local_conv = kda.local_conv
+        model_config.encoder.kda.qkv_silu = kda.qkv_silu
         # chunk_size has no engine-side field -- it only controls how the
         # chunkwise-parallel algorithm splits work, not the model's math
         # (see kda_recurrence's docstring), so there is nothing to recover
