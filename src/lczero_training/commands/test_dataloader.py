@@ -28,6 +28,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         help="Optional path to store fetched batches as an .npz archive.",
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="train",
+        help=(
+            "DataLoader output to read from. A config with a chunk source "
+            "splitter exposes named outputs (typically train and test) and "
+            "the loader rejects the empty name, so probing such a config "
+            "without this fails outright."
+        ),
+    )
     return parser
 
 
@@ -44,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         config_filename=args.config,
         num_batches=args.num_batches,
         npz_output=args.npz_output,
+        output=args.output,
     )
     return 0
 

@@ -31,7 +31,10 @@ def _store_batches(path: str, batches: list) -> None:
 
 
 def probe_dataloader(
-    config_filename: str, num_batches: int, npz_output: Optional[str] = None
+    config_filename: str,
+    num_batches: int,
+    npz_output: Optional[str] = None,
+    output: str = "train",
 ) -> None:
     """Measure latency and throughput for the configured data loader.
 
@@ -39,6 +42,11 @@ def probe_dataloader(
         config_filename: Path to the root configuration proto file.
         num_batches: Total number of batches to fetch from the loader.
         npz_output: Optional path to store fetched batches as an .npz archive.
+        output: Name of the DataLoader output to read from. Defaults to
+            "train". This is not optional in practice on any config with a
+            chunk source splitter: the loader raises "Unknown DataLoader
+            output: ''" for the empty name, so the probe could not run at
+            all against a train/test config before this was threaded through.
     """
 
     if num_batches < 1:
@@ -59,7 +67,7 @@ def probe_dataloader(
     try:
         logger.info("Fetching first batch")
         start_time = time.perf_counter()
-        first_batch = loader.get_next()
+        first_batch = loader.get_next(output)
         if collect_enabled:
             collected_batches.append(first_batch)
         first_batch_time = time.perf_counter() - start_time
@@ -75,7 +83,7 @@ def probe_dataloader(
         )
         throughput_start = time.perf_counter()
         for _ in range(remaining_batches):
-            batch = loader.get_next()
+            batch = loader.get_next(output)
             if collect_enabled:
                 collected_batches.append(batch)
         throughput_duration = time.perf_counter() - throughput_start
