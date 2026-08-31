@@ -80,6 +80,50 @@ KDA_TRAVERSALS = {
             )
         )
     ),
+    # Boustrophedon ("serpentine") variants of the four orthogonal walks:
+    # every other rank/file is reversed, so consecutive tokens are ALWAYS
+    # board adjacent. Plain rank_forward jumps 7 squares at each rank wrap
+    # (7 of its 63 steps), which is why only ~33% of a 5-token recurrence
+    # window lands within 2 squares; these make that 100% / ~59%. Selected
+    # by KdaConfig.serpentine, which substitutes them for the orthogonal
+    # four -- the diagonals are left alone.
+    "rank_serpentine": tuple(
+        rank * 8 + (file if rank % 2 == 0 else 7 - file)
+        for rank in range(8)
+        for file in range(8)
+    ),
+    "rank_serpentine_reverse": tuple(
+        reversed(
+            tuple(
+                rank * 8 + (file if rank % 2 == 0 else 7 - file)
+                for rank in range(8)
+                for file in range(8)
+            )
+        )
+    ),
+    "file_serpentine": tuple(
+        (rank if file % 2 == 0 else 7 - rank) * 8 + file
+        for file in range(8)
+        for rank in range(8)
+    ),
+    "file_serpentine_reverse": tuple(
+        reversed(
+            tuple(
+                (rank if file % 2 == 0 else 7 - rank) * 8 + file
+                for file in range(8)
+                for rank in range(8)
+            )
+        )
+    ),
+}
+
+# Applied to KdaConfig.directions when KdaConfig.serpentine is set. The
+# config keeps the original names so the exported net format is unchanged.
+SERPENTINE_SUBSTITUTIONS = {
+    "rank_forward": "rank_serpentine",
+    "rank_reverse": "rank_serpentine_reverse",
+    "file_forward": "file_serpentine",
+    "file_reverse": "file_serpentine_reverse",
 }
 
 # Per-token log decay floor. Retaining exp(-10) of the state per token is
@@ -329,6 +373,13 @@ class KdaMixer(nn.Module):
         assert heads % len(directions) == 0, (
             "encoder heads must be evenly divisible by len(directions)."
         )
+        if config.serpentine:
+            # Substituted here, once, so every downstream consumer (the
+            # permutation tables, the head slices) sees the serpentine walk
+            # without any of them needing to know about the flag.
+            directions = [
+                SERPENTINE_SUBSTITUTIONS.get(name, name) for name in directions
+            ]
 
         self.heads = heads
         self.directions = directions
@@ -337,6 +388,7 @@ class KdaMixer(nn.Module):
         self.value_dim = config.value_dim
         self.gate_rank = config.gate_rank
         self.chunk_size = config.chunk_size
+        self.qkv_silu = config.qkv_silu
         self.output_gate = config.output_gate
         self.output_rms_norm = config.output_rms_norm
 
@@ -423,6 +475,16 @@ class KdaMixer(nn.Module):
         query = self.q(proj_input).reshape(shape)
         key = self.k(proj_input).reshape(shape)
         value = self.v(proj_input).reshape(shape)
+        if self.qkv_silu:
+            # fla's KimiDeltaAttention ALWAYS activates q/k/v -- through
+            # ShortConvolution(activation="silu"), or as a bare F.silu when
+            # short conv is off. Our port dropped the activation along with
+            # the conv, which left the value path linear end to end. Applied
+            # before last_value is captured, so the interpretability hook
+            # still sees exactly what enters the recurrence.
+            query = torch.nn.functional.silu(query)
+            key = torch.nn.functional.silu(key)
+            value = torch.nn.functional.silu(value)
         if self.collect_attention_target:
             # Undetached, deliberately: kda_attention() backprops through
             # this into `last_mixed` below to get an exact Jacobian.

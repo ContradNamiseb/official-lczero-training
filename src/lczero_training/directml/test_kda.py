@@ -20,6 +20,7 @@ from lczero_training.directml import layers
 from lczero_training.directml.kda import (
     KDA_LOG_DECAY_FLOOR,
     KDA_TRAVERSALS,
+    SERPENTINE_SUBSTITUTIONS,
     KdaLocalConv,
     KDALogDecay,
     KdaMixer,
@@ -602,3 +603,49 @@ def test_mixer_directml_matches_cpu(dml_device):
     expected = mixer(x).detach().numpy()
     actual = mixer.to(dml_device)(x.to(dml_device)).detach().cpu().numpy()
     _assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+def test_serpentine_traversals_are_gap_free_permutations():
+    """The serpentine walks must be real permutations with no board jumps.
+
+    A jump is what makes plain rank_forward's recurrence window mostly
+    geometric noise, so "no jumps" is the entire point of these tables.
+    """
+    def chebyshev(a: int, b: int) -> int:
+        return max(abs(a // 8 - b // 8), abs(a % 8 - b % 8))
+
+    for name in SERPENTINE_SUBSTITUTIONS.values():
+        order = KDA_TRAVERSALS[name]
+        assert sorted(order) == list(range(64)), name
+        steps = [chebyshev(order[i], order[i + 1]) for i in range(63)]
+        assert max(steps) == 1, f"{name} jumps {max(steps)} squares"
+
+
+def test_serpentine_and_silu_keep_the_checkpoint_loadable():
+    """Neither flag may add, drop, or reshape a parameter.
+
+    Both were introduced to be swappable into a run already in progress, so
+    a strict load of pre-flag weights has to keep working.
+    """
+    def build(serpentine: bool, qkv_silu: bool) -> KdaMixer:
+        config = model_config_pb2.KdaConfig(
+            key_dim=32, value_dim=32, gate_rank=32, chunk_size=16,
+            output_gate=True, output_rms_norm=False, local_conv=False,
+            serpentine=serpentine, qkv_silu=qkv_silu,
+            directions=list(KDA_TRAVERSALS)[:8],
+        )
+        torch.manual_seed(0)
+        return KdaMixer(
+            in_features=128, config=config, heads=16, deepnorm_beta=0.5
+        )
+
+    base, flagged = build(False, False), build(True, True)
+    assert {k: v.shape for k, v in base.state_dict().items()} == {
+        k: v.shape for k, v in flagged.state_dict().items()
+    }
+    flagged.load_state_dict(base.state_dict(), strict=True)
+
+    x = torch.randn(2, 64, 128)
+    assert torch.isfinite(flagged(x)).all()
+    # The flags must actually change the function, or the swap is a no-op.
+    assert not torch.allclose(base(x), flagged(x))

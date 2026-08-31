@@ -77,6 +77,25 @@ message KdaConfig {
   // Tokens per chunk of the parallel KDA recurrence. Smaller chunks trade
   // less sequential depth for more dense work; per-backend tunable.
   optional uint32 chunk_size = 8 [default = 16];
+  // Walk the four orthogonal traversals as a boustrophedon (serpentine):
+  // reverse every other rank/file so consecutive tokens are always board
+  // adjacent. Plain rank_forward jumps 7 squares at each rank wrap, so 7 of
+  // its 63 steps are geometric noise and only ~33% of a 5-token recurrence
+  // window lands within 2 squares; serpentine makes that 100% / ~59%.
+  // Costs nothing -- it is only a different permutation table.
+  //
+  // NOTE: the direction NAMES in `directions` are unchanged, so the exported
+  // net still declares rank_forward/etc. The engine's own token->square
+  // mapping is not serpentine, so a net trained with this flag will not match
+  // engine inference until the SYCL/BLAS kernels learn the same order. That
+  // is already true of the 8-direction nets (see LC0_MINOR_WITH_KDA_8_DIRECTION).
+  optional bool serpentine = 9 [default = false];
+  // Apply SiLU to the q/k/v projections, as fla's KimiDeltaAttention does --
+  // it always activates q/k/v, either through ShortConvolution(activation=
+  // "silu") or as a bare F.silu when short conv is off. Our port dropped the
+  // activation along with the conv, leaving the value path fully linear.
+  // Elementwise, so essentially free; carries the same engine caveat as above.
+  optional bool qkv_silu = 10 [default = false];
 }
 
 message SmolgenConfig {
