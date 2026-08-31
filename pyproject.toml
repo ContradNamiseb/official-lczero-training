@@ -155,8 +155,27 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+# ...except on Linux, where the cuda-torch extra exists precisely to get a
+# CUDA build. Pointing `torch` at the CPU index unconditionally made that
+# extra silently useless: `uv sync --extra cuda-torch` installed a +cpu
+# wheel, torch.cuda.is_available() returned False, and the only way anyone
+# ever got a working trainer was to pip-install a CUDA wheel by hand --
+# which the next `uv run` then overwrote, because uv re-syncs the
+# environment before running anything. Selecting the index by platform is
+# what makes the extra mean what its name says.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# cu128 rather than an older CUDA: Blackwell (sm_120) has no kernels in
+# CUDA 12.6 or earlier, so an RTX PRO / RTX 50-series card loads the wheel
+# and then fails at the first kernel launch.
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+]
 
 
 [tool.pytest.ini_options]
@@ -176,3 +195,27 @@ markers = [
 [tool.ruff]
 exclude = ["*_pb2.py*"]
 line-length = 80
+
+[tool.uv]
+# directml pins torch==2.4.1 (torch-directml builds against exactly that) and
+# cuda-torch needs torch>=2.5. The sys_platform markers make them mutually
+# exclusive at install time, but uv resolves universally and sees a conflict,
+# so the exclusivity has to be declared explicitly.
+conflicts = [
+    [
+        { extra = "directml" },
+        { extra = "cuda-torch" },
+    ],
+]
+
+# The two platforms this project actually targets, declared so uv resolves
+# them as separate splits. Without this the universal resolver puts Windows
+# and Linux in one split (`sys_platform != 'darwin'`) and rejects the
+# per-platform torch indexes above as "conflicting indexes for package
+# torch" -- the CPU index and the cu128 index both apply to the same split.
+# Naming the environments makes those markers disjoint, so each platform
+# resolves torch from exactly one index.
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
+]
